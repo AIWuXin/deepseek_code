@@ -36,8 +36,10 @@ class SessionPickerScreen(Screen[str | None]):
 
     TITLE = "Saved Sessions"
 
+    # NOTE: do NOT bind "enter" here. ListView consumes Enter and emits a
+    # ListView.Selected message (which on_list_view_selected handles); a
+    # screen-level enter binding never fires, so selection would silently break.
     BINDINGS = [
-        ("enter", "select", "Resume"),
         ("d", "delete", "Delete"),
         ("escape", "cancel", "Cancel"),
     ]
@@ -80,9 +82,10 @@ class SessionPickerScreen(Screen[str | None]):
             lv.index = min(keep_index, len(self._names) - 1)
         self._refreshing = False
 
-    # -- actions --------------------------------------------------------------
+    # -- selection / actions --------------------------------------------------
 
-    def action_select(self) -> None:
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Fires on Enter-in-list and on mouse click — the real resume path."""
         index = self.query_one(ListView).index
         if self._names and index is not None and 0 <= index < len(self._names):
             self.dismiss(self._names[index])
