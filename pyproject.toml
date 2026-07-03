@@ -1,0 +1,28 @@
+[project]
+name = "deepseek-code"
+version = "0.1.0"
+description = "DeepSeek Code — a token-frugal, long-context terminal coding agent optimized for DeepSeek V4"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40.0",
+    "textual>=0.60.0",
+    "rich>=13.7.0",
+    "tomli-w>=1.0.0",
+    "ddgs>=9.14.4",
+]
+
+[project.scripts]
+dsc = "dsc.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dsc"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
