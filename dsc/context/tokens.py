@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import json
 
-# Roughly 3.5 chars/token for mixed code + English + Chinese. Errs slightly
-# high, which is the safe direction for a compaction trigger.
-CHARS_PER_TOKEN = 3.5
+# Chars per token heuristic.  DeepSeek V4 / GPT-5 tokenizers average:
+#   English prose         ~4.0
+#   Chinese text          ~1.5–2.0
+#   code                  ~3.5
+#   JSON / structured     ~2.5–3.0
+# We use a conservative 2.8 so we *over*-estimate for mixed workloads,
+# which is the safe direction for a compaction trigger — better to compact
+# a tiny bit early than to hit the API's hard context limit.
+CHARS_PER_TOKEN = 2.8
 
 
 def estimate_tokens(text: str) -> int:

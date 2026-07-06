@@ -15,6 +15,8 @@ from .edit import EditTool
 from .write import WriteTool
 from .bash import BashTool
 from .web_search import WebSearchTool
+from .web_fetch import WebFetchTool
+from .read_archive import ReadArchiveTool
 
 
 def build_registry(root: str) -> ToolRegistry:
@@ -28,6 +30,8 @@ def build_registry(root: str) -> ToolRegistry:
     reg.register(WriteTool(root))
     reg.register(BashTool(root))
     reg.register(WebSearchTool(root))
+    reg.register(WebFetchTool(root))
+    reg.register(ReadArchiveTool(root))
     return reg
 
 

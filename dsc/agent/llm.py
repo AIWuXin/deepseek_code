@@ -89,8 +89,13 @@ class DeepSeekClient:
                 yield StreamDelta(content=delta.content)
 
             for tc in delta.tool_calls or []:
+                # DeepSeek normally sends a stable integer index per tool call.
+                # Fall back if a chunk ever arrives without one — otherwise every
+                # index-less chunk collapses into key None and overwrites the
+                # prior call, silently dropping tool calls.
+                idx = tc.index if tc.index is not None else len(tool_acc)
                 slot = tool_acc.setdefault(
-                    tc.index,
+                    idx,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
                 if tc.id:

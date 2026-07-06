@@ -11,8 +11,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 
 from .base import Tool, ToolResult
+from ..debug import log
 
 MAX_OUTPUT_CHARS = 30_000
 DEFAULT_TIMEOUT = 120
@@ -87,6 +89,9 @@ class BashTool(Tool):
             argv = command
             popen_kwargs = {"cwd": str(self.root), "shell": True}
 
+        preview = (command or "").replace("\n", " ")[:80]
+        log(f"bash: start {preview!r} timeout={timeout}")
+        t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 argv,
@@ -97,12 +102,21 @@ class BashTool(Tool):
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
+                # stdin isolated from the TUI: a child that reads stdin (an
+                # accidental input(), a library probing the tty) must get
+                # immediate EOF instead of hanging on Textual's input handle —
+                # which is what froze the app on `python -c` scripts.
+                stdin=subprocess.DEVNULL,
                 **popen_kwargs,
             )
         except subprocess.TimeoutExpired:
+            log(f"bash: TIMEOUT after {timeout}s {preview!r}")
             return ToolResult(f"Command timed out after {timeout}s.", is_error=True)
         except OSError as e:
+            log(f"bash: OSError {e!r}")
             return ToolResult(f"Failed to run command: {e}", is_error=True)
+
+        log(f"bash: done in {time.monotonic() - t0:.1f}s exit={proc.returncode} {preview!r}")
 
         combined = (proc.stdout or "") + (proc.stderr or "")
         combined = _truncate_middle(combined.strip())

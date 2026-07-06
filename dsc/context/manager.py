@@ -25,6 +25,9 @@ prefix stays stable across the majority of turns.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
+from .compaction import KEEP_TURNS, find_clean_tail_start
 from .tokens import estimate_messages
 
 # Tool results older than this many messages from the tail are eligible for
@@ -32,6 +35,18 @@ from .tokens import estimate_messages
 PRUNE_KEEP_RECENT = 8
 PRUNE_MIN_CHARS = 1500  # only prune results big enough to be worth it
 STUB = "[old tool result cleared to save context]"
+
+# V2 cleaning gateway threshold: total saved tokens must exceed this ratio
+# of context_limit before we risk breaking the mid-stream cache.
+COMPRESS_THRESHOLD_RATIO = 0.1
+
+
+@dataclass
+class ArchiveInfo:
+    """Lightweight in-memory cache of an archived task (messages excluded)."""
+
+    archive_id: int
+    in_context_summary: str
 
 
 class ContextManager:
@@ -41,10 +56,17 @@ class ContextManager:
         self._system = {"role": "system", "content": system_prompt}
         self._messages: list[dict] = []
 
+        # V2 archive marking (Phase 1).  Per-message parallel list; None =
+        # unarchived, int = archive block ID.  NEVER renders into API calls.
+        self._archive_id: list[int | None] = []
+        # Lightweight cache of archive summaries (full messages stay on disk).
+        self._archives: dict[int, ArchiveInfo] = {}
+
     # -- message construction -------------------------------------------------
 
     def add_user(self, text: str) -> None:
         self._messages.append({"role": "user", "content": text})
+        self._archive_id.append(None)
 
     def add_assistant(self, content: str, tool_calls: list[dict] | None = None) -> None:
         # reasoning_content is intentionally dropped: DeepSeek returns 400 if it
@@ -53,11 +75,13 @@ class ContextManager:
         if tool_calls:
             msg["tool_calls"] = tool_calls
         self._messages.append(msg)
+        self._archive_id.append(None)
 
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
         self._messages.append(
             {"role": "tool", "tool_call_id": tool_call_id, "content": content}
         )
+        self._archive_id.append(None)
 
     # -- rendering ------------------------------------------------------------
 
@@ -94,20 +118,186 @@ class ContextManager:
                     pruned += 1
         return pruned
 
-    def replace_history(self, summary: str, keep_recent: int) -> None:
-        """Compaction hook: swap early history for a summary, keep recent tail."""
-        tail = self._messages[-keep_recent:] if keep_recent else []
+    def replace_history(self, summary: str, keep_turns: int = KEEP_TURNS) -> None:
+        """Swap summarised early history for a summary; retain recent turns.
+
+        Uses ``find_clean_tail_start`` to cut at a complete turn boundary so
+        ``tool`` messages are never orphaned from their ``assistant`` caller.
+        """
+        tail_start = find_clean_tail_start(self._messages, keep_turns)
+        tail = self._messages[tail_start:]
+        tail_aid = self._archive_id[tail_start:]  # keep matching archive marks
         summary_msg = {
-            "role": "user",
+            "role": "system",
             "content": f"[Summary of earlier conversation]\n{summary}",
         }
         self._messages = [summary_msg, *tail]
+        self._archive_id = [None, *tail_aid]
+
+    @staticmethod
+    def find_clean_task_boundary(messages: list[dict], target_idx: int) -> int:
+        """Walk backwards from ``target_idx`` to the nearest preceding ``user`` message.
+
+        Returns ``-1`` if no user message is found.  Clamped to ``len-1`` so
+        ``target_idx == len(messages)`` does not index past the end.
+        """
+        i = min(target_idx, len(messages) - 1) if messages else 0
+        while i >= 0 and messages[i].get("role") != "user":
+            i -= 1
+        return i
 
     # -- accessors for compaction ---------------------------------------------
 
     def restore(self, messages: list[dict]) -> None:
         """Replace all history with loaded session messages."""
         self._messages = list(messages)
+        # Reset archive marks on restore — they are rebuilt on-demand.
+        self._archive_id = [None] * len(self._messages)
+        self._archives.clear()
+
+    # -- V2 archive marking (Phase 1) -----------------------------------------
+
+    def mark_archived(self, start: int, end: int, archive_id: int) -> None:
+        """Mark messages [start, end) as belonging to archive ``archive_id``.
+
+        ``start`` **must** be on a ``user`` turn boundary — the caller is
+        responsible for aligning it (see ``find_clean_task_boundary``).
+        """
+        for i in range(start, min(end, len(self._archive_id))):
+            self._archive_id[i] = archive_id
+
+    # -- Phase 3: batch compression + smart cleanup ---------------------------
+
+    def _collect_compressible_ranges(self) -> list[tuple[int, int, int]]:
+        """Scan ``_archive_id`` for contiguous ranges and return ``(start, end, archive_id)``.
+
+        Only returns ranges whose total token savings exceed
+        ``COMPRESS_THRESHOLD_RATIO * context_limit``.
+        """
+        estimated_saved = 0
+        ranges: list[tuple[int, int, int]] = []
+        i = 0
+        while i < len(self._messages):
+            aid = self._archive_id[i]
+            if aid is None or self._messages[i].get("role") != "user":
+                i += 1
+                continue
+
+            # Found the start of an archived range at a user boundary.
+            j = i
+            while j < len(self._messages) and self._archive_id[j] == aid:
+                j += 1
+
+            start = self.find_clean_task_boundary(self._messages, i)
+            end = self.find_clean_task_boundary(self._messages, j)
+            if start < 0 or start >= end:
+                i = j
+                continue
+
+            # Estimate token savings: sum all messages in [start, end).
+            raw_len = sum(
+                estimate_messages([self._messages[k]]) for k in range(start, end)
+            )
+            estimated_saved += max(0, raw_len - 10)
+
+            ranges.append((start, end, aid))
+            i = end  # skip past this range
+
+        threshold = int(self.limit * COMPRESS_THRESHOLD_RATIO)
+        if estimated_saved < threshold:
+            return []
+        return ranges
+
+    def compress_archived_ranges(self) -> int:
+        """Batch-replace contiguous archived message ranges with their summaries.
+
+        Scans ``_archive_id`` in real time.  Returns the number of ranges
+        compressed (0 means no threshold met or nothing to compress).
+        """
+        ranges = self._collect_compressible_ranges()
+        if not ranges:
+            return 0
+
+        replaced = 0
+        # Process from the end backward so indices stay valid.
+        for start, end, aid in reversed(ranges):
+            archive = self._archives.get(aid)
+            if archive is None:
+                continue
+            summary_msg = {
+                "role": "system",
+                "content": f"[Task summary] {archive.in_context_summary}",
+            }
+            self._messages[start:end] = [summary_msg]
+            self._archive_id[start:end] = [None]
+            replaced += 1
+        return replaced
+
+    def cleanup_tail(self) -> tuple[int, int, int]:
+        """Smart cleanup of the tail when over budget.
+
+        Returns ``(deleted_backed_up, deleted_read_archive, archived_new)``.
+        Does NOT touch ``[Task summary]`` messages (those are mid-term
+        summaries that survive until explicit demotion).
+        """
+        deleted_bu = 0   # backed-up original messages
+        deleted_ra = 0   # read_archive results
+        archived_new = 0  # newly archived unarchived messages
+
+        # Work from the front of the message list (oldest first).
+        # Keep at least the last few turns untouched.
+        keep_tail = max(2, len(self._messages) - 8)
+        i = 0
+        while i < keep_tail:
+            msg = self._messages[i]
+            aid = self._archive_id[i] if i < len(self._archive_id) else None
+            content = msg.get("content", "")
+
+            # 1. Backed-up original → delete.
+            if aid is not None and not content.startswith("[Task summary]"):
+                self._messages.pop(i)
+                self._archive_id.pop(i)
+                deleted_bu += 1
+                keep_tail -= 1
+                continue
+
+            # 2. read_archive result → delete (disk has the original).
+            if content.startswith("[Archive #"):
+                self._messages.pop(i)
+                self._archive_id.pop(i)
+                deleted_ra += 1
+                keep_tail -= 1
+                continue
+
+            # 3. Unarchived original → skip (can't auto-archive in cleanup
+            #    without a sub-agent call; caller handles this).
+            i += 1
+
+        return deleted_bu, deleted_ra, archived_new
+
+    # -- Phase 3 helpers -------------------------------------------------------
+
+    def populate_archives(self, archive_dir_path: str) -> None:
+        """Load ``ArchiveInfo`` from disk for all known archive IDs."""
+        from pathlib import Path
+        import json
+
+        p = Path(archive_dir_path)
+        if not p.exists():
+            return
+        for f in sorted(p.glob("*.json")):
+            try:
+                with f.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            aid = data.get("id")
+            summary = data.get("in_context_summary", "")
+            if aid is not None and summary:
+                self._archives[aid] = ArchiveInfo(
+                    archive_id=aid,
+                    in_context_summary=summary,
+                )
 
     @property
     def messages(self) -> list[dict]:

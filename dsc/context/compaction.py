@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 
-KEEP_RECENT = 6  # verbatim messages retained after the summary
+# Number of *complete user→assistant→(tools)* turns to keep verbatim.
+KEEP_TURNS = 3
 
 SUMMARY_INSTRUCTION = (
     "You are compacting a coding-agent conversation to save context. "
@@ -20,11 +21,41 @@ SUMMARY_INSTRUCTION = (
     "next steps. Omit chit-chat and raw tool dumps. Use terse bullet points."
 )
 
+# Safety cap: never send more than this many characters to the summary model.
+# ~50k chars ≈ 15k tokens — leaves plenty of room for system prompt + output.
+MAX_SUMMARY_INPUT_CHARS = 50_000
 
-def build_summary_request(messages: list[dict], keep_recent: int = KEEP_RECENT) -> list[dict]:
-    """Build a one-off request that asks the model to summarize old history."""
-    to_summarize = messages[:-keep_recent] if keep_recent else messages
+
+def find_clean_tail_start(messages: list[dict], keep_turns: int = KEEP_TURNS) -> int:
+    """Walk backwards to find the start of the ``keep_turns``-th complete turn.
+
+    A complete turn begins with a ``user`` message.  If the assistant replied
+    with ``tool_calls``, the subsequent ``tool`` results belong to the same turn
+    and must be kept together.  Returns the index of the first message to keep.
+    """
+    turns_found = 0
+    i = len(messages) - 1
+    while i >= 0 and turns_found < keep_turns:
+        if messages[i].get("role") == "user":
+            turns_found += 1
+        i -= 1
+    return i + 1
+
+
+def build_summary_request(messages: list[dict], keep_turns: int = KEEP_TURNS) -> list[dict]:
+    """Build a one-off request that asks the model to summarize old history.
+
+    Automatically truncates the input to ``MAX_SUMMARY_INPUT_CHARS`` to avoid
+    exceeding the model's own context window.
+    """
+    tail_start = find_clean_tail_start(messages, keep_turns)
+    to_summarize = messages[:tail_start]
     transcript = _flatten(to_summarize)
+    if len(transcript) > MAX_SUMMARY_INPUT_CHARS:
+        transcript = (
+            transcript[:MAX_SUMMARY_INPUT_CHARS]
+            + "\n\n[truncated — rest of history omitted]"
+        )
     return [
         {"role": "system", "content": SUMMARY_INSTRUCTION},
         {"role": "user", "content": transcript},

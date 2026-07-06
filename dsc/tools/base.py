@@ -85,3 +85,7 @@ class ToolRegistry:
             return ToolResult(f"Bad arguments for {name}: {e}", is_error=True)
         except Exception as e:  # tools must never crash the loop
             return ToolResult(f"{name} failed: {e}", is_error=True)
+
+    def get(self, name: str) -> Tool | None:
+        """Look up a registered tool by name."""
+        return self._tools.get(name)

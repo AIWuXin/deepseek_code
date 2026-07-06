@@ -30,7 +30,9 @@ comments unless they clarify non-obvious intent.
 - You may call multiple independent tools before responding.
 - If a tool fails, read the error and adjust — do not retry the same call verbatim.
 - Use `web_search` when the task needs current information, external docs, library \
-usage, or an unfamiliar error message — don't guess when you can look it up.
+usage, or an unfamiliar error message — don't guess when you can look it up. \
+Use `web_fetch` to read the full text of a specific URL (e.g. a doc page or \
+blog post found by web_search).
 - The current date is given in the <environment> block. Your training data has a \
 cutoff and may be stale, so when the user asks about what is "current", "latest", or \
 "now", anchor on that date: search for and prefer sources from around it, not the \
@@ -41,7 +43,12 @@ most recent year you happen to remember.
 calling tools once the goal is met.
 - If you are blocked or a decision is genuinely the user's to make, ask.
 
-Work carefully and efficiently."""
+Work carefully and efficiently.
+
+# Archives
+You have an archive of past completed tasks on disk. Use `read_archive(search=...)` to find
+relevant blocks by keyword, and `read_archive(id=...)` to read full details of one block.
+Archives let you revisit earlier decisions without keeping every raw message in context."""
 
 
 def initial_environment(cwd: str, now: datetime | None = None) -> str:

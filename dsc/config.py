@@ -41,6 +41,9 @@ class Config:
     context_limit: int = 200_000
     # Hard stop for the agent loop, guards against runaway tool cycles.
     max_iterations: int = 25
+    # Phase 3: use V2 cleaning (compress archived ranges + smart cleanup)
+    # instead of the old compaction.  Default off until battle-tested.
+    v2_cleaning: bool = False
     # Enable deepseek-reasoner-style thinking. V4 flash/pro both support it.
     thinking: bool = False
     extra: dict = field(default_factory=dict)
@@ -68,6 +71,7 @@ def load_config() -> Config:
         context_limit=int(data.get("context_limit", 200_000)),
         max_iterations=int(data.get("max_iterations", 25)),
         thinking=bool(data.get("thinking", False)),
+        v2_cleaning=bool(data.get("v2_cleaning", False)),
         extra=data,
     )
     return cfg

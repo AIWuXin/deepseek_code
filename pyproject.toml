@@ -10,6 +10,8 @@ dependencies = [
     "rich>=13.7.0",
     "tomli-w>=1.0.0",
     "ddgs>=9.14.4",
+    "trafilatura>=2.0.0",
+    "markdownify>=1.0.0",
 ]
 
 [project.scripts]

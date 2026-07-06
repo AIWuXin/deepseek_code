@@ -20,7 +20,7 @@ class WebSearchTool(Tool):
         "Search the web (DuckDuckGo) and return the top results as title, URL, "
         "and a short snippet. Use for current information, docs, error messages, "
         "or anything outside the workspace. Returns snippets, not full pages — "
-        "fetch a URL separately if you need the full text."
+        "use web_fetch to read the full text of any result."
     )
     parameters = {
         "type": "object",

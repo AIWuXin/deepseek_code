@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from dsc.session import store as store_mod
-from dsc.session.store import SessionStore, describe_session
+from dsc.session.store import SessionStore, describe_session, ArchiveBlock
 
 
 @pytest.fixture(autouse=True)
@@ -109,3 +109,124 @@ def test_delete_removes_jsonl_and_title_sidecar():
 
 def test_delete_missing_returns_false():
     assert SessionStore.delete("never-existed") is False
+
+
+def test_replace_rewrites_jsonl():
+    s = SessionStore("replace-test")
+    s.append({"role": "user", "content": "old"})
+    s.replace([
+        {"role": "user", "content": "new1"},
+        {"role": "assistant", "content": "new2"},
+    ])
+    assert s.load() == [
+        {"role": "user", "content": "new1"},
+        {"role": "assistant", "content": "new2"},
+    ]
+    assert s.path.read_text(encoding="utf-8").count("\n") == 2
+
+
+# -- Phase 1: archive ---------------------------------------------------------
+
+def test_archive_block_roundtrip():
+    s = SessionStore("arc-test")
+    block = ArchiveBlock(
+        id=0,
+        summary="Added web_fetch",
+        keywords="web_fetch, trafilatura",
+        in_context_summary="Added a web_fetch tool using trafilatura.",
+        messages=[{"role": "user", "content": "add it"}],
+    )
+    s.archive_block(block)
+
+    loaded = s.load_block(0)
+    assert loaded is not None
+    assert loaded["summary"] == "Added web_fetch"
+    assert loaded["keywords"] == "web_fetch, trafilatura"
+    assert loaded["in_context_summary"] == "Added a web_fetch tool using trafilatura."
+    assert len(loaded["messages"]) == 1
+
+
+def test_search_blocks_by_keyword():
+    s = SessionStore("arc-search")
+    b1 = ArchiveBlock(0, "Fixed login bug", "login, auth, bug", "Fixed null ptr in login", [])
+    b2 = ArchiveBlock(1, "Added API endpoint", "api, endpoint, flask", "Created /users endpoint", [])
+    s.archive_block(b1)
+    s.archive_block(b2)
+
+    hits = s.search_blocks("login")
+    assert len(hits) == 1
+    assert hits[0]["id"] == 0
+
+    hits = s.search_blocks("api endpoint")
+    assert len(hits) == 1
+    assert hits[0]["id"] == 1
+
+    hits = s.search_blocks("nonexistent")
+    assert len(hits) == 0
+
+
+def test_list_blocks_returns_all():
+    s = SessionStore("arc-list")
+    s.archive_block(ArchiveBlock(0, "A", "a", "a", []))
+    s.archive_block(ArchiveBlock(1, "B", "b", "b", []))
+    blocks = s.list_blocks()
+    assert [b["id"] for b in blocks] == [0, 1]
+
+
+# -- Phase 2: read_archive tool -----------------------------------------------
+
+def test_read_archive_tool_schema():
+    from dsc.tools.read_archive import ReadArchiveTool
+    tool = ReadArchiveTool(root=".")
+    schema = tool.schema()
+    assert schema["function"]["name"] == "read_archive"
+    props = schema["function"]["parameters"]["properties"]
+    assert "search" in props
+    assert "id" in props
+
+
+def test_read_archive_search(tmp_path):
+    from dsc.tools.read_archive import ReadArchiveTool
+
+    # Create an archive block.
+    arc_dir = tmp_path / "sess1_arc"
+    arc_dir.mkdir(parents=True)
+    (arc_dir / "0000.json").write_text(
+        '{"id": 0, "summary": "Added web_fetch", "keywords": "tool, fetch, web", "in_context_summary": "", "messages": []}',
+        encoding="utf-8",
+    )
+
+    tool = ReadArchiveTool(root=".")
+    tool._archive_dir = arc_dir
+    result = tool.run(search="web_fetch")
+    assert not result.is_error
+    assert "Added web_fetch" in result.content
+
+    result = tool.run(search="nonexistent")
+    assert not result.is_error
+    assert "0" in result.display  # "read_archive search: 0"
+
+
+def test_read_archive_read_block(tmp_path):
+    from dsc.tools.read_archive import ReadArchiveTool
+
+    arc_dir = tmp_path / "sess2_arc"
+    arc_dir.mkdir(parents=True)
+    (arc_dir / "0001.json").write_text(
+        '{"id": 1, "summary": "Fixed bug", "in_context_summary": "Fixed null ptr", '
+        '"messages": [{"role": "user", "content": "fix it"}, {"role": "assistant", "content": "done"}]}',
+        encoding="utf-8",
+    )
+
+    tool = ReadArchiveTool(root=".")
+    tool._archive_dir = arc_dir
+    result = tool.run(id=1)
+    assert not result.is_error
+    assert "[Archive #1]" in result.content
+    assert "Fixed bug" in result.content
+
+    # Missing block.
+    result = tool.run(id=99)
+    assert result.is_error
+
+

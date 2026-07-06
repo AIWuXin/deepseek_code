@@ -19,6 +19,7 @@ from .commands import CommandScreen
 from .prompt import PromptInput
 from .session_picker import SessionPickerScreen
 from .widgets import AssistantMessage, Notice, ReasoningBlock, ToolLine, ToolOutput, UserMessage
+from ..debug import log
 
 
 class StatusBar(Static):
@@ -274,6 +275,17 @@ class DSCApp(App):
         self._refresh_status()  # title now shows in the status bar
 
     def _handle_event(self, ev) -> None:
+        log(f"ui: recv {ev.kind} display={ev.display!r}")
+        try:
+            self._dispatch_event(ev)
+        except Exception as e:
+            # A rendering failure in one event must never silently swallow the
+            # rest of the turn — that's exactly how a tool call "vanishes".
+            log(f"ui: ERROR handling {ev.kind}: {e!r}")
+            self._append(Notice(f"render error ({ev.kind}): {e}"))
+        self._refresh_status()
+
+    def _dispatch_event(self, ev) -> None:
         if ev.kind == "reasoning":
             self._reasoning_buf += ev.text
             if self._reasoning is None:
@@ -284,8 +296,10 @@ class DSCApp(App):
             if self._live is None:
                 self._live = AssistantMessage("")
                 self._append(self._live)
-            self._live.append_text(ev.text)
-            self._scroll()
+            # append_text returns True only when it actually repainted; tie
+            # scroll to the same cadence so we don't reflow the log per token.
+            if self._live.append_text(ev.text):
+                self._scroll()
         elif ev.kind == "tool_start":
             self._append(ToolLine(f"→ {ev.display}", running=True))
         elif ev.kind == "tool_end":
@@ -298,9 +312,11 @@ class DSCApp(App):
             self._append(Notice(ev.text))
         elif ev.kind == "done":
             self._reset_live()
-        self._refresh_status()
 
     def _reset_live(self) -> None:
+        if self._live is not None:
+            self._live.finalize()  # streaming plain text → full Markdown render
+            self._scroll()
         self._live = None
         self._reasoning = None
         self._reasoning_buf = ""
