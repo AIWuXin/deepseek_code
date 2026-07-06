@@ -9,17 +9,58 @@ verbatim preserves the working state the agent needs to continue.
 from __future__ import annotations
 
 import json
+import re
 
 # Number of *complete user→assistant→(tools)* turns to keep verbatim.
 KEEP_TURNS = 3
 
+# The compaction summary must survive as the agent's only memory of the early
+# conversation, so the instruction is structured (fixed dimensions, nothing
+# silently dropped) and guards against the two classic failure modes:
+#   * the model calling a tool instead of writing text (wastes the one turn);
+#   * task drift — the summary paraphrasing the request until intent shifts,
+#     countered by quoting the most recent request verbatim.
+# The <analysis> block is a scratchpad to lift generation quality; it is stripped
+# by ``format_compact_summary`` before the summary enters context, so it never
+# costs us the tokens we are trying to reclaim.
 SUMMARY_INSTRUCTION = (
-    "You are compacting a coding-agent conversation to save context. "
-    "Summarize everything below into a dense brief that lets the agent continue "
-    "without the original transcript. Preserve: the user's goal and constraints, "
-    "files and symbols touched, decisions made, current state, and any pending "
-    "next steps. Omit chit-chat and raw tool dumps. Use terse bullet points."
+    "You are compacting a coding-agent conversation to free up context while "
+    "preserving everything needed to continue the work.\n\n"
+    "Respond with TEXT ONLY. Do NOT call any tools — you have exactly one turn "
+    "and a tool call wastes it.\n\n"
+    "First, think inside a <analysis>...</analysis> block: scan the whole "
+    "conversation and note what matters. That block is a scratchpad and will be "
+    "DISCARDED, so every fact you want to keep must appear in the final brief "
+    "AFTER the closing </analysis> tag.\n\n"
+    "The brief MUST cover these dimensions (drop a heading only if truly empty):\n"
+    "1. Goal & constraints — what the user ultimately wants; any hard rules.\n"
+    "2. Key technical concepts and decisions, with their rationale.\n"
+    "3. Files & symbols touched — paths, functions, classes.\n"
+    "4. Errors encountered and how they were fixed.\n"
+    "5. Current state — what is done and working right now.\n"
+    "6. Pending next steps.\n"
+    "7. Recent context — quote the most recent user request and the task "
+    "currently in progress VERBATIM so intent does not drift.\n\n"
+    "Be terse: bullet points, no chit-chat, no raw tool-output dumps."
 )
+
+_ANALYSIS_RE = re.compile(r"<analysis>.*?</analysis>", re.DOTALL | re.IGNORECASE)
+
+
+def format_compact_summary(raw: str) -> str:
+    """Strip the model's ``<analysis>`` scratchpad, keeping only the final brief.
+
+    Falls back to the raw text if stripping would leave nothing (e.g. the model
+    put everything inside the block, or emitted an unterminated tag).
+    """
+    text = raw or ""
+    # Drop complete <analysis>...</analysis> blocks, then any unterminated opener
+    # (model forgot to close the tag → everything after it is scratchpad).
+    cleaned = _ANALYSIS_RE.sub("", text)
+    cleaned = re.sub(r"(?is)<analysis>.*$", "", cleaned).strip()
+    # If stripping left nothing (the whole reply was the scratchpad), salvage the
+    # raw text rather than handing back an empty summary.
+    return cleaned or text.strip()
 
 # Safety cap: never send more than this many characters to the summary model.
 # ~50k chars ≈ 15k tokens — leaves plenty of room for system prompt + output.

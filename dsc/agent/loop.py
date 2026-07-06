@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from ..config import Config
-from ..context.compaction import build_summary_request, _flatten
+from ..context.compaction import build_summary_request, format_compact_summary, _flatten
 from ..context.manager import ContextManager
 from ..context.tokens import CostMeter
 from ..session import SessionStore
@@ -215,7 +215,11 @@ class AgentLoop:
             return
 
         # Collect messages for this turn (user → assistant(s) → tools).
-        turn_msgs = list(self.ctx.messages[self._turn_start_idx:])
+        # Reclamation earlier in the turn may have shrunk the message list, so
+        # ``_turn_start_idx`` (captured at turn start) can now point past the
+        # end — clamp it to stay in bounds (J2).
+        start_idx = min(self._turn_start_idx, len(self.ctx.messages))
+        turn_msgs = list(self.ctx.messages[start_idx:])
         if len(turn_msgs) < 2:  # need at least user + assistant
             return
 
@@ -244,11 +248,12 @@ class AgentLoop:
 
         # Mark messages in context as archived.  Ensure we start at a clean
         # user boundary so later compression won't cut a tool chain in half.
-        start = self.ctx.find_clean_task_boundary(
-            self.ctx.messages, self._turn_start_idx
-        )
+        start = self.ctx.find_clean_task_boundary(self.ctx.messages, start_idx)
         end = len(self.ctx.messages)
-        if start >= 0 and start < end:
+        # Only mark when ``start`` truly lands on a user turn boundary; a stale
+        # index could otherwise sweep the previous turn into this archive id and
+        # corrupt the range for later compression (J1/J2).
+        if 0 <= start < end and self.ctx.messages[start].get("role") == "user":
             self.ctx.mark_archived(start, end, aid)
 
         log(f"archive: task #{aid} — {summary}")
@@ -384,11 +389,16 @@ class AgentLoop:
                 "notice",
                 text=f"Cleaned {total_deleted} messages ({saved} tokens saved).",
             )
-            # Sync store so resume doesn't reload deleted messages.
+        # Sync store whenever the in-context history changed — including when
+        # only compression fired (n>0) but nothing was deleted. Otherwise resume
+        # reloads the old, uncompressed messages and silently loses the work (J3).
+        if n or total_deleted:
             self._store.replace(self.ctx.messages)
 
-        if now > self.ctx.limit:
-            # Still over budget after V2 → fall back to old compaction.
+        if now > self.ctx.high_water:
+            # Still above high-water after V2 → fall back to old compaction,
+            # which drops to the last few turns and lands us well below the
+            # low-water target.
             yield LoopEvent("notice", text="V2 cleaning insufficient — falling back to compaction.")
             yield from self._reclaim_old()
 
@@ -397,7 +407,7 @@ class AgentLoop:
         yield LoopEvent("notice", text="Compacting history…")
         req = build_summary_request(self.ctx.messages)
         try:
-            summary = self.client.complete(req)
+            summary = format_compact_summary(self.client.complete(req))
             self.ctx.replace_history(summary)
             self._store.replace(self.ctx.messages)
             yield LoopEvent("notice", text="History compacted.")

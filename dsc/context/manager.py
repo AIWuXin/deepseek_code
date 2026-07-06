@@ -40,6 +40,17 @@ STUB = "[old tool result cleared to save context]"
 # of context_limit before we risk breaking the mid-stream cache.
 COMPRESS_THRESHOLD_RATIO = 0.1
 
+# Reclamation watermarks (fractions of ``limit``).
+#
+# Every reclamation pass breaks the cached prefix for one turn — it rewrites or
+# drops messages that are no longer at the tail. So the goal is to break the
+# cache *rarely and deeply*: trigger at the high-water mark (before the hard
+# limit, so we never nibble near the ceiling every turn) and reclaim all the way
+# down toward the low-water target, buying many stable, cache-hitting turns
+# before the next break.
+HIGH_WATER_RATIO = 0.92
+LOW_WATER_RATIO = 0.70
+
 
 @dataclass
 class ArchiveInfo:
@@ -94,16 +105,32 @@ class ContextManager:
 
     # -- reclamation ----------------------------------------------------------
 
+    @property
+    def high_water(self) -> int:
+        """Trigger reclamation once the estimate crosses this (below the limit)."""
+        return int(self.limit * HIGH_WATER_RATIO)
+
+    @property
+    def low_water(self) -> int:
+        """Target to reclaim down toward, so the next break is many turns away."""
+        return int(self.limit * LOW_WATER_RATIO)
+
     def maybe_reclaim(self) -> str | None:
-        """Reclaim space if over budget. Returns a note if action was taken."""
-        if self.estimated_tokens() <= self.limit:
+        """Reclaim space if over the high-water mark. Returns a note if acted.
+
+        We trigger at ``high_water`` rather than the hard ``limit`` so a single
+        cache-breaking pass has room to reclaim deeply instead of the agent
+        oscillating just under the ceiling — pruning a sliver and breaking the
+        cache every single turn.
+        """
+        if self.estimated_tokens() <= self.high_water:
             return None
         pruned = self._prune_old_tool_results()
-        if self.estimated_tokens() <= self.limit:
+        if self.estimated_tokens() <= self.high_water:
             if pruned:
                 return f"pruned {pruned} old tool result(s)"
             return None
-        # Still over budget after pruning → caller should compact.
+        # Still above high-water after pruning → caller should compact deeply.
         return "needs_compaction"
 
     def _prune_old_tool_results(self) -> int:
@@ -144,6 +171,23 @@ class ContextManager:
         i = min(target_idx, len(messages) - 1) if messages else 0
         while i >= 0 and messages[i].get("role") != "user":
             i -= 1
+        return i
+
+    @staticmethod
+    def _next_turn_boundary(messages: list[dict], target_idx: int) -> int:
+        """Walk *forward* from ``target_idx`` to the next ``user`` message.
+
+        The mirror of ``find_clean_task_boundary`` (which walks backward).  Used
+        to extend an archived range's right edge to a complete-turn boundary so a
+        range never splits a turn and orphans its ``tool`` results.  Returns
+        ``len(messages)`` when no later ``user`` message exists (the range runs
+        to the end of history).  When ``messages[target_idx]`` is already a
+        ``user`` message it returns ``target_idx`` unchanged.
+        """
+        n = len(messages)
+        i = max(0, target_idx)
+        while i < n and messages[i].get("role") != "user":
+            i += 1
         return i
 
     # -- accessors for compaction ---------------------------------------------
@@ -189,7 +233,10 @@ class ContextManager:
                 j += 1
 
             start = self.find_clean_task_boundary(self._messages, i)
-            end = self.find_clean_task_boundary(self._messages, j)
+            # Right end must extend *forward* to the next turn boundary; using
+            # the backward finder here (old C1 bug) pulled ``end`` back into the
+            # range, splitting the turn and orphaning its tool results.
+            end = self._next_turn_boundary(self._messages, j)
             if start < 0 or start >= end:
                 i = j
                 continue
@@ -245,8 +292,27 @@ class ContextManager:
         archived_new = 0  # newly archived unarchived messages
 
         # Work from the front of the message list (oldest first).
-        # Keep at least the last few turns untouched.
-        keep_tail = max(2, len(self._messages) - 8)
+        # Protect the tail, snapped to a ``user`` turn boundary so the retained
+        # tail always starts on a turn boundary and no ``tool`` result is
+        # orphaned from its assistant caller (C2 bug → API 400).
+        #
+        # Two levels of protection:
+        #   * long history → keep ~8 recent messages (backward-snapped cutoff);
+        #   * short history (the whole list fits in ~8) → the backward snap
+        #     collapses to 0, so fall back to protecting just the most recent
+        #     *complete* turn.  Archived / read_archive messages older than that
+        #     are on disk and always safe to drop, so we still reclaim them
+        #     instead of bailing out entirely (C2 short-history regression).
+        n = len(self._messages)
+        if n < 2:
+            return 0, 0, 0
+        soft = self.find_clean_task_boundary(self._messages, max(0, n - 8))
+        keep_tail = soft if soft > 0 else self.find_clean_task_boundary(
+            self._messages, n - 1
+        )
+        if keep_tail <= 0:
+            # Only the current turn exists → nothing older is safe to delete.
+            return 0, 0, 0
         i = 0
         while i < keep_tail:
             msg = self._messages[i]

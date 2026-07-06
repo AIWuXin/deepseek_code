@@ -3,10 +3,40 @@
 from __future__ import annotations
 
 from dsc.context.manager import PRUNE_KEEP_RECENT, STUB, ContextManager, ArchiveInfo
+from dsc.context.compaction import format_compact_summary
 
 
 def _mgr(limit=200_000):
     return ContextManager("SYSTEM", limit)
+
+
+# -- Compaction summary formatting (analysis scratchpad stripping) ------------
+
+def test_format_compact_summary_strips_analysis():
+    raw = "<analysis>\nthinking out loud, lots of tokens\n</analysis>\n" \
+          "- Goal: build the parser\n- Next: add tests"
+    out = format_compact_summary(raw)
+    assert "analysis" not in out.lower()
+    assert "thinking out loud" not in out
+    assert out.startswith("- Goal: build the parser")
+
+
+def test_format_compact_summary_no_analysis_passthrough():
+    raw = "- Goal: ship the feature\n- State: done"
+    assert format_compact_summary(raw) == raw
+
+
+def test_format_compact_summary_unterminated_tag_salvages():
+    # Model opened <analysis> but never closed it → drop from the opener on,
+    # rather than returning a scratchpad as the summary.
+    raw = "prefix brief line\n<analysis>\nunterminated rambling"
+    out = format_compact_summary(raw)
+    assert out == "prefix brief line"
+
+
+def test_format_compact_summary_empty_is_safe():
+    assert format_compact_summary("") == ""
+    assert format_compact_summary(None) == ""  # type: ignore[arg-type]
 
 
 def test_system_is_stable_head():
@@ -207,6 +237,112 @@ def test_compress_archived_ranges_skips_recent_tail():
     n = m.compress_archived_ranges()
     assert n == 1  # Only the archived range was compressed
     assert len(m.messages) == 3  # summary + user + assistant
+
+
+def test_watermark_properties():
+    m = _mgr(limit=1000)
+    assert m.high_water == 920   # 0.92 * limit
+    assert m.low_water == 700    # 0.70 * limit
+
+
+def test_reclaim_fires_in_watermark_gap():
+    """Reclamation must trigger at high-water, before the hard limit.
+
+    Old behaviour only acted when tokens exceeded ``limit``; now we act in the
+    (high_water, limit] gap so we never nibble at the ceiling every turn.
+    """
+    m = _mgr(limit=1000)
+    m.add_user("go")
+    m.add_assistant("", [{"id": "1", "type": "function",
+                          "function": {"name": "read", "arguments": "{}"}}])
+    m.add_tool_result("1", "x" * 2400)  # prunable big old result
+    for i in range(PRUNE_KEEP_RECENT + 2):
+        m.add_user(f"pad{i}")           # push it out of the keep-recent window
+
+    tokens = m.estimated_tokens()
+    # Land inside the (high_water, limit] gap to prove early triggering.
+    assert m.high_water < tokens <= m.limit, tokens
+    assert m.maybe_reclaim() is not None
+
+
+def test_reclaim_noop_below_high_water():
+    m = _mgr(limit=100_000)
+    m.add_user("small")
+    m.add_assistant("also small")
+    assert m.estimated_tokens() < m.high_water
+    assert m.maybe_reclaim() is None
+
+
+def test_next_turn_boundary_walks_forward():
+    """Right-edge finder must extend forward, never pull back into the range."""
+    m = _mgr()
+    m.add_user("a")                                              # 0 user
+    m.add_assistant("", [{"id": "tc1", "type": "function",
+                          "function": {"name": "r", "arguments": "{}"}}])  # 1 asst
+    m.add_tool_result("tc1", "result")                          # 2 tool
+    m.add_user("b")                                             # 3 user
+    m.add_assistant("done")                                     # 4 asst
+
+    # From inside the first turn's tail (idx 1/2) → next user boundary is 3.
+    assert m._next_turn_boundary(m.messages, 1) == 3
+    assert m._next_turn_boundary(m.messages, 2) == 3
+    # Already on a user boundary → unchanged.
+    assert m._next_turn_boundary(m.messages, 3) == 3
+    # No later user message → clamps to len (range runs to end).
+    assert m._next_turn_boundary(m.messages, 4) == len(m.messages)
+
+
+def test_compress_uses_forward_boundary_not_backward():
+    """Regression: compress must not crash and must keep turns whole.
+
+    Reproduces the C1 bug where ``_next_turn_boundary`` was called but never
+    defined (AttributeError), and the earlier variant used the backward finder
+    which split turns.
+    """
+    m = _mgr(limit=50)
+    # One archived task that ends with a tool result, then a live tail.
+    m.add_user("task - build the indexer with incremental updates")   # 0
+    m.add_assistant("", [{"id": "t1", "type": "function",
+                          "function": {"name": "read", "arguments": "{}"}}])  # 1
+    m.add_tool_result("t1", "x" * 200)                                # 2
+    m.mark_archived(0, 3, 30)
+    m._archives[30] = ArchiveInfo(archive_id=30, in_context_summary="Built indexer.")
+    m.add_user("now add a status bar")                                # 3 (live tail)
+    m.add_assistant("ok")                                             # 4
+
+    n = m.compress_archived_ranges()
+    assert n == 1
+    # The archived tool result must be gone (folded into the summary), and the
+    # live tail must survive intact.
+    assert any(x.get("content", "").startswith("[Task summary]") for x in m.messages)
+    tail_users = [x for x in m.messages if x.get("role") == "user"]
+    assert any("status bar" in x["content"] for x in tail_users)
+    # No orphaned tool result left behind.
+    assert not any(x.get("role") == "tool" for x in m.messages)
+
+
+def test_cleanup_tail_short_history_still_cleans_archived():
+    """Regression (C2): a short history must not disable cleanup entirely.
+
+    With the whole list inside the ~8-message keep window, the backward snap
+    collapses to 0; we must fall back to protecting only the last turn so
+    on-disk archived messages are still reclaimed.
+    """
+    m = _mgr(limit=1_000_000)
+    m.add_user("archived task")     # 0
+    m.add_assistant("done")         # 1
+    m.mark_archived(0, 2, 1)
+    m._archives[1] = ArchiveInfo(archive_id=1, in_context_summary="Done.")
+    m.add_user("current")           # 2 (last turn — must be protected)
+    m.add_assistant("active")       # 3
+
+    bu, ra, _new = m.cleanup_tail()
+    assert bu == 2                  # both backed-up messages dropped
+    # Last turn preserved.
+    assert m.messages[-2:] == [
+        {"role": "user", "content": "current"},
+        {"role": "assistant", "content": "active"},
+    ]
 
 
 def test_cleanup_tail_deletes_backed_up_and_read_archive():
