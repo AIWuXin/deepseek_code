@@ -73,11 +73,23 @@ class ContextManager:
         # Lightweight cache of archive summaries (full messages stay on disk).
         self._archives: dict[int, ArchiveInfo] = {}
 
+        # Token accounting cache. estimate_messages is fully additive per
+        # message, so tokens(system + msgs) == tokens(system) + tokens(msgs).
+        # The system head never changes → estimate it once. The message sum is
+        # maintained incrementally on append (the hot path: checked every loop
+        # iteration) and lazily recomputed after any structural/content mutation
+        # via the dirty flag. Turning an O(n²)-per-session scan into O(1) checks.
+        self._system_tokens = estimate_messages([self._system])
+        self._msg_tokens = 0
+        self._tokens_dirty = False
+
     # -- message construction -------------------------------------------------
 
     def add_user(self, text: str) -> None:
-        self._messages.append({"role": "user", "content": text})
+        msg = {"role": "user", "content": text}
+        self._messages.append(msg)
         self._archive_id.append(None)
+        self._msg_tokens += estimate_messages([msg])
 
     def add_assistant(self, content: str, tool_calls: list[dict] | None = None) -> None:
         # reasoning_content is intentionally dropped: DeepSeek returns 400 if it
@@ -87,12 +99,13 @@ class ContextManager:
             msg["tool_calls"] = tool_calls
         self._messages.append(msg)
         self._archive_id.append(None)
+        self._msg_tokens += estimate_messages([msg])
 
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
-        self._messages.append(
-            {"role": "tool", "tool_call_id": tool_call_id, "content": content}
-        )
+        msg = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+        self._messages.append(msg)
         self._archive_id.append(None)
+        self._msg_tokens += estimate_messages([msg])
 
     # -- rendering ------------------------------------------------------------
 
@@ -101,7 +114,12 @@ class ContextManager:
         return [self._system, *self._messages]
 
     def estimated_tokens(self) -> int:
-        return estimate_messages(self.render())
+        if self._tokens_dirty:
+            # A mutation touched message bodies/structure — recompute the sum
+            # once and clear the flag. Rare (only on reclamation).
+            self._msg_tokens = estimate_messages(self._messages)
+            self._tokens_dirty = False
+        return self._system_tokens + self._msg_tokens
 
     # -- reclamation ----------------------------------------------------------
 
@@ -143,6 +161,8 @@ class ContextManager:
                 if len(m["content"]) >= PRUNE_MIN_CHARS:
                     m["content"] = STUB
                     pruned += 1
+        if pruned:
+            self._tokens_dirty = True  # bodies changed in place
         return pruned
 
     def replace_history(self, summary: str, keep_turns: int = KEEP_TURNS) -> None:
@@ -160,6 +180,7 @@ class ContextManager:
         }
         self._messages = [summary_msg, *tail]
         self._archive_id = [None, *tail_aid]
+        self._tokens_dirty = True
 
     @staticmethod
     def find_clean_task_boundary(messages: list[dict], target_idx: int) -> int:
@@ -198,6 +219,7 @@ class ContextManager:
         # Reset archive marks on restore — they are rebuilt on-demand.
         self._archive_id = [None] * len(self._messages)
         self._archives.clear()
+        self._tokens_dirty = True
 
     # -- V2 archive marking (Phase 1) -----------------------------------------
 
@@ -278,6 +300,8 @@ class ContextManager:
             self._messages[start:end] = [summary_msg]
             self._archive_id[start:end] = [None]
             replaced += 1
+        if replaced:
+            self._tokens_dirty = True
         return replaced
 
     def cleanup_tail(self) -> tuple[int, int, int]:
@@ -339,6 +363,8 @@ class ContextManager:
             #    without a sub-agent call; caller handles this).
             i += 1
 
+        if deleted_bu or deleted_ra:
+            self._tokens_dirty = True
         return deleted_bu, deleted_ra, archived_new
 
     # -- Phase 3 helpers -------------------------------------------------------

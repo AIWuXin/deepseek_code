@@ -4,10 +4,105 @@ from __future__ import annotations
 
 from dsc.context.manager import PRUNE_KEEP_RECENT, STUB, ContextManager, ArchiveInfo
 from dsc.context.compaction import format_compact_summary
+from dsc.context.tokens import estimate_messages
 
 
 def _mgr(limit=200_000):
     return ContextManager("SYSTEM", limit)
+
+
+def _truth(m: ContextManager) -> int:
+    """Ground-truth token count: a full, uncached recompute over render()."""
+    return estimate_messages(m.render())
+
+
+# -- Token cache correctness (incremental sum + dirty invalidation) -----------
+
+def test_token_cache_matches_full_recompute_after_every_op():
+    """The cached estimate must equal a fresh recompute after EVERY mutation.
+
+    This is the safety net for the incremental cache: if a future mutation
+    forgets to invalidate ``_tokens_dirty``, one of these assertions fails.
+    """
+    # append paths
+    m = _mgr(limit=1000)
+    m.add_user("hello world")
+    assert m.estimated_tokens() == _truth(m)
+    m.add_assistant("hi", [{"id": "1", "type": "function",
+                            "function": {"name": "read", "arguments": "{}"}}])
+    assert m.estimated_tokens() == _truth(m)
+    m.add_tool_result("1", "z" * 3000)
+    assert m.estimated_tokens() == _truth(m)
+
+    # in-place prune (stubbing bodies)
+    for i in range(PRUNE_KEEP_RECENT + 2):
+        m.add_user(f"pad{i}")
+    m._prune_old_tool_results()
+    assert m.estimated_tokens() == _truth(m)
+
+    # mark_archived alone changes nothing token-wise
+    m.mark_archived(0, 2, 1)
+    assert m.estimated_tokens() == _truth(m)
+
+    # compress archived ranges (slice replacement)
+    mc = _mgr(limit=50)
+    mc.add_user("task - build the widget with plenty of descriptive content")
+    mc.add_assistant("done - built it thoroughly with many implementation details")
+    mc.mark_archived(0, 2, 3)
+    mc._archives[3] = ArchiveInfo(archive_id=3, in_context_summary="Built widget.")
+    mc.add_user("recent")
+    mc.add_assistant("ok")
+    mc.compress_archived_ranges()
+    assert mc.estimated_tokens() == _truth(mc)
+
+    # cleanup_tail (pops)
+    mt = _mgr(limit=1_000_000)
+    mt.add_user("archived task")
+    mt.add_assistant("done")
+    mt.mark_archived(0, 2, 1)
+    mt._archives[1] = ArchiveInfo(archive_id=1, in_context_summary="Done.")
+    mt.add_user("current")
+    mt.add_assistant("active")
+    mt.cleanup_tail()
+    assert mt.estimated_tokens() == _truth(mt)
+
+    # replace_history (rebuild)
+    mr = _mgr()
+    for i in range(8):
+        mr.add_user(f"m{i}")
+    mr.replace_history("SUMMARY", keep_turns=2)
+    assert mr.estimated_tokens() == _truth(mr)
+
+    # restore (reassign)
+    mr.restore([{"role": "user", "content": "new"},
+                {"role": "assistant", "content": "reply"}])
+    assert mr.estimated_tokens() == _truth(mr)
+
+
+def test_token_cache_append_stays_clean():
+    """The hot path (append + check) must not flip the dirty flag."""
+    m = _mgr()
+    m.add_user("a")
+    assert m._tokens_dirty is False
+    m.add_assistant("b")
+    m.add_tool_result("1", "c")
+    assert m._tokens_dirty is False
+    # And the value is right without ever hitting a full recompute.
+    assert m.estimated_tokens() == _truth(m)
+
+
+def test_token_cache_dirty_set_then_cleared():
+    m = _mgr(limit=1_000_000)
+    m.add_user("archived task")
+    m.add_assistant("done")
+    m.mark_archived(0, 2, 1)
+    m._archives[1] = ArchiveInfo(archive_id=1, in_context_summary="Done.")
+    m.add_user("current")
+    m.add_assistant("active")
+    m.cleanup_tail()
+    assert m._tokens_dirty is True       # mutation flagged it
+    _ = m.estimated_tokens()
+    assert m._tokens_dirty is False      # lazy recompute cleared it
 
 
 # -- Compaction summary formatting (analysis scratchpad stripping) ------------
