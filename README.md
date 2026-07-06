@@ -63,7 +63,7 @@ thinking = false              # enable V4 thinking mode
 ## Tools
 
 `read` · `grep` (ripgrep) · `glob` · `edit` (search-replace) · `write` ·
-`bash` (Git Bash on Windows) · `web_search` (DuckDuckGo, no API key)
+`bash` (Git Bash on Windows) · `web` (search DuckDuckGo or fetch pages)
 
 ## Architecture
 

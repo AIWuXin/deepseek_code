@@ -17,10 +17,11 @@ from typing import Iterator
 from ..config import Config
 from ..context.compaction import build_summary_request, format_compact_summary, _flatten
 from ..context.manager import ContextManager
+from ..context.repair import repair_dangling_tool_calls
 from ..context.tokens import CostMeter
 from ..session import SessionStore
 from ..session.store import ArchiveBlock
-from ..tools import ToolRegistry
+from ..tools import ToolRegistry, ToolResult
 from .llm import Completion, DeepSeekClient, StreamDelta
 from .prompts import SYSTEM_PROMPT, initial_environment
 from ..debug import log
@@ -109,6 +110,12 @@ class AgentLoop:
             # Resume: load existing session messages into context.
             stored = self._store.load()
             if stored:
+                # Repair any dangling tool_calls left by an earlier crash so the
+                # session is valid for the API again; persist the fix.
+                stored, repaired = repair_dangling_tool_calls(stored)
+                if repaired:
+                    self._store.replace(stored)
+                    log("resume: repaired dangling tool_calls in session")
                 self.ctx.restore(stored)
             else:
                 # Fallback: fresh start.
@@ -149,19 +156,27 @@ class AgentLoop:
                 name, args = fn["name"], fn["arguments"]
                 log(f"loop: yield tool_start name={name} id={tc.get('id')}")
                 yield LoopEvent("tool_start", display=f"{name}({_preview(args)})")
-                result = self.registry.execute(name, args)
-                log(f"loop: executed {name} error={result.is_error} bytes={len(result.content)}")
+                # Everything from execute through post-processing is wrapped so a
+                # bug here can NEVER skip add_tool_result below — an assistant
+                # message with tool_calls that isn't answered by a tool message
+                # corrupts the session (DeepSeek 400s on the next request).
+                try:
+                    result = self.registry.execute(name, args)
+                    log(f"loop: executed {name} error={result.is_error} bytes={len(result.content)}")
 
-                # Phase 2: compress read_archive(id) results via sub-agent.
-                if name == "read_archive" and not result.is_error:
-                    compressed = self._compress_read_archive(result.content)
-                    if compressed is not None:
-                        result = ToolResult(
-                            content=compressed,
-                            display=result.display,
-                            is_error=False,
-                        )
-                        log(f"loop: compressed read_archive result to {len(compressed)} bytes")
+                    # Phase 2: compress read_archive(id) results via sub-agent.
+                    if name == "read_archive" and not result.is_error:
+                        compressed = self._compress_read_archive(result.content)
+                        if compressed is not None:
+                            result = ToolResult(
+                                content=compressed,
+                                display=result.display,
+                                is_error=False,
+                            )
+                            log(f"loop: compressed read_archive result to {len(compressed)} bytes")
+                except Exception as e:
+                    log(f"loop: tool handler crashed for {name}: {e!r}")
+                    result = ToolResult(content=f"tool handler error: {e}", is_error=True)
 
                 self.ctx.add_tool_result(tc["id"], result.content)
                 self._store.append(
@@ -303,6 +318,22 @@ class AgentLoop:
             data.get("in_context_summary", ""),
         )
 
+    def export(self, cwd: str) -> str:
+        """Write the full stored conversation to a Markdown file in ``cwd``.
+
+        Reads from disk (the complete transcript) rather than the in-context
+        messages, so compaction doesn't shrink the export. Returns the path.
+        """
+        from pathlib import Path
+        from ..session.export import to_markdown
+
+        messages = self._store.load() or list(self.ctx.messages)
+        title = self.title or self._store.name
+        md = to_markdown(title, messages)
+        out = Path(cwd) / f"dsc-{self._store.name}.md"
+        out.write_text(md, encoding="utf-8")
+        return str(out)
+
     def generate_title(self, first_user_text: str) -> str | None:
         """Name the session with one isolated LLM call.
 
@@ -405,12 +436,22 @@ class AgentLoop:
     def _reclaim_old(self) -> Iterator[LoopEvent]:
         """Original compaction: summarize early history (old behaviour)."""
         yield LoopEvent("notice", text="Compacting history…")
+        before = self.ctx.estimated_tokens()
         req = build_summary_request(self.ctx.messages)
         try:
             summary = format_compact_summary(self.client.complete(req))
             self.ctx.replace_history(summary)
             self._store.replace(self.ctx.messages)
-            yield LoopEvent("notice", text="History compacted.")
+            after = self.ctx.estimated_tokens()
+            saved = before - after
+            limit = self.ctx.limit or 1
+            yield LoopEvent(
+                "notice",
+                text=(
+                    f"History compacted — saved {saved:,} tokens "
+                    f"({before * 100 // limit}% → {after * 100 // limit}%)."
+                ),
+            )
         except Exception as e:
             yield LoopEvent("notice", text=f"Compaction failed ({e}); continuing.")
 

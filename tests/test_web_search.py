@@ -1,11 +1,11 @@
-"""Web search tool: result formatting and error handling (no live network)."""
+"""Web tool: result formatting and error handling for search mode (no live network)."""
 
 from __future__ import annotations
 
 import sys
 import types
 
-from dsc.tools.web_search import SNIPPET_CHARS, WebSearchTool
+from dsc.tools.web import SNIPPET_CHARS, WebTool
 
 
 def _install_fake_ddgs(monkeypatch, hits=None, error=None):
@@ -36,7 +36,7 @@ def test_formats_results(monkeypatch):
             {"title": "T2", "href": "https://b.com", "body": "snippet two"},
         ],
     )
-    res = WebSearchTool(".").run(query="python asyncio")
+    res = WebTool(".").run(query="python asyncio")
     assert not res.is_error
     assert "1. T1" in res.content
     assert "https://a.com" in res.content
@@ -48,7 +48,7 @@ def test_snippet_is_truncated(monkeypatch):
         monkeypatch,
         hits=[{"title": "Long", "href": "https://x.com", "body": "z" * 5000}],
     )
-    res = WebSearchTool(".").run(query="q")
+    res = WebTool(".").run(query="q")
     assert "…" in res.content
     # Body is capped well under the raw length.
     assert len(res.content) < 5000
@@ -56,14 +56,14 @@ def test_snippet_is_truncated(monkeypatch):
 
 def test_no_results(monkeypatch):
     _install_fake_ddgs(monkeypatch, hits=[])
-    res = WebSearchTool(".").run(query="nothing")
+    res = WebTool(".").run(query="nothing")
     assert not res.is_error
     assert "No web results" in res.content
 
 
 def test_search_error_is_handled(monkeypatch):
     _install_fake_ddgs(monkeypatch, error=RuntimeError("network down"))
-    res = WebSearchTool(".").run(query="q")
+    res = WebTool(".").run(query="q")
     assert res.is_error
     assert "network down" in res.content
 
@@ -87,5 +87,27 @@ def test_max_results_clamped(monkeypatch):
     mod.DDGS = FakeDDGS
     monkeypatch.setitem(sys.modules, "ddgs", mod)
 
-    WebSearchTool(".").run(query="q", max_results=999)
+    WebTool(".").run(query="q", max_results=999)
     assert captured["n"] == 10  # clamped to MAX_RESULTS
+
+
+def test_fetch_empty_list_is_error():
+    """An empty urls list is rejected."""
+    res = WebTool(".").run(urls=[])
+    assert res.is_error
+
+
+def test_both_query_and_urls_prefers_search(monkeypatch):
+    """If model sends both, search wins (common first step)."""
+    _install_fake_ddgs(
+        monkeypatch,
+        hits=[{"title": "T", "href": "https://a.com", "body": "body"}],
+    )
+    res = WebTool(".").run(query="python", urls=["https://example.com"])
+    assert not res.is_error
+    assert "1. T" in res.content  # search result, not fetch error
+
+
+def test_neither_query_nor_urls_is_error():
+    res = WebTool(".").run()
+    assert res.is_error

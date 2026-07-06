@@ -10,6 +10,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/clear", "Clear the conversation log"),
     ("/commands", "Show this command menu"),
     ("/exit", "Exit the application"),
+    ("/export", "Export this conversation to a Markdown file"),
     ("/help", "Show this command menu"),
     ("/model <name>", "Switch to a different model"),
     ("/quit", "Exit the application"),

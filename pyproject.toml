@@ -12,7 +12,14 @@ dependencies = [
     "ddgs>=9.14.4",
     "trafilatura>=2.0.0",
     "markdownify>=1.0.0",
+    "requests>=2.31.0",
+    "pyperclip>=1.11.0",
 ]
+
+[project.optional-dependencies]
+# Render ```mermaid blocks in assistant replies as terminal diagrams.
+# Optional: without it, mermaid blocks just show as normal code.
+mermaid = ["termaid[rich]>=0.7.1"]
 
 [project.scripts]
 dsc = "dsc.cli:main"

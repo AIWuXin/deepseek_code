@@ -78,6 +78,55 @@ def test_full_turn_executes_tool(tmp_path):
     assert loop.meter.usd > 0
 
 
+class CrashToolClient:
+    """Turn 1 asks for a tool; the handler will be forced to crash. Turn 2 ends."""
+
+    def __init__(self):
+        self.model = "deepseek-v4-flash"
+        self.calls = 0
+
+    def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield Completion(
+                content="",
+                tool_calls=[{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }],
+                finish_reason="tool_calls",
+            )
+        else:
+            yield Completion(content="recovered", finish_reason="stop")
+
+    def complete(self, messages):
+        return "summary"
+
+
+def test_tool_handler_crash_never_dangles(tmp_path, monkeypatch):
+    """Even if the tool handler raises, the tool_call must still be answered.
+
+    Regression for the `ToolResult` NameError that skipped add_tool_result and
+    left a dangling tool_calls message → API 400 on the next request.
+    """
+    loop = AgentLoop(Config(api_key="x"), build_registry(str(tmp_path)), str(tmp_path))
+    loop.client = CrashToolClient()
+
+    def boom(name, args):
+        raise RuntimeError("simulated handler crash")
+
+    monkeypatch.setattr(loop.registry, "execute", boom)
+
+    list(loop.send("go"))
+
+    msgs = loop.ctx.messages
+    called = {tc["id"] for m in msgs if m.get("role") == "assistant"
+              for tc in (m.get("tool_calls") or [])}
+    answered = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+    assert called and called <= answered           # every call answered
+    assert loop.client.calls == 2                  # loop continued past the crash
+
+
 def test_prefix_stability(tmp_path):
     """System message stays byte-identical; history only grows at the tail."""
     cfg = Config(api_key="x")

@@ -18,7 +18,15 @@ from ..session import SessionStore, describe_session
 from .commands import CommandScreen
 from .prompt import PromptInput
 from .session_picker import SessionPickerScreen
-from .widgets import AssistantMessage, Notice, ReasoningBlock, ToolLine, ToolOutput, UserMessage
+from .widgets import (
+    AssistantMessage,
+    MermaidBlock,
+    Notice,
+    ReasoningBlock,
+    ToolLine,
+    ToolOutput,
+    UserMessage,
+)
 from ..debug import log
 
 
@@ -52,7 +60,7 @@ class DSCApp(App):
     }
     /* Cap content width so long lines wrap in a readable column instead of
        running into the right border. */
-    UserMessage, AssistantMessage, ReasoningBlock, ToolLine, Notice {
+    UserMessage, AssistantMessage, ReasoningBlock, ToolLine, Notice, ToolOutput, MermaidBlock {
         max-width: 100;
     }
     PromptInput {
@@ -84,6 +92,9 @@ class DSCApp(App):
         Binding("ctrl+p", "show_commands", "Commands", priority=True),
     ]
 
+    # Idle prompt caption; also restored after each turn (see _clear_activity).
+    _PROMPT_HINT = "Enter send · Shift+Enter newline · F1 commands · Esc interrupt · Ctrl+C quit"
+
     def __init__(self, config, registry, cwd: str, session_name: str | None = None):
         super().__init__()
         self.config = config
@@ -97,12 +108,15 @@ class DSCApp(App):
         self._reasoning: ReasoningBlock | None = None
         self._reasoning_buf = ""
         self._busy = False
+        # Auto-scroll follows the tail until the user scrolls up; it resumes when
+        # they scroll back to the bottom or send a new message.
+        self._follow = True
 
     def compose(self) -> ComposeResult:
         yield StatusBar()
         yield VerticalScroll(id="log")
         prompt = PromptInput()
-        prompt.border_title = "Enter send · Shift+Enter newline · F1 commands · Esc interrupt · Ctrl+C quit"
+        prompt.border_title = self._PROMPT_HINT
         yield prompt
         yield Footer()
 
@@ -111,8 +125,18 @@ class DSCApp(App):
         if self._resumed_name:
             self._append(Notice(f"Resumed '{self._resumed_name}' — earlier history below:"))
             self._render_history(self.loop.ctx.messages)
+        else:
+            self._welcome()
         self._refresh_status()
         self.query_one(PromptInput).focus()
+
+    def _welcome(self) -> None:
+        """A short banner with the key bindings — shown on start and after /clear."""
+        self._append(Notice(
+            f"DeepSeek Code · {self.loop.config.model}\n"
+            "  Enter 发送 · Shift+Enter 换行 · F1 命令 · Esc 中断\n"
+            "  /help 查看全部命令 · /export 导出对话"
+        ))
 
     def _render_history(self, messages: list[dict]) -> None:
         """Paint stored messages so a resumed session shows what came before.
@@ -151,9 +175,11 @@ class DSCApp(App):
             if self._handle_command(text):
                 return
 
+        self._follow = True  # sending a message means "show me the reply"
         self._append(UserMessage(text))
         self._busy = True
         self._live = None
+        self._set_activity("thinking…")
         self.run_turn(text)
 
         # First turn of a fresh session → name it in the background (isolated
@@ -172,6 +198,14 @@ class DSCApp(App):
             return True
         if cmd == "clear":
             self.query_one("#log", VerticalScroll).remove_children()
+            self._welcome()
+            return True
+        if cmd == "export":
+            try:
+                path = self.loop.export(self.cwd)
+                self._append(Notice(f"Exported conversation → {path}"))
+            except Exception as e:
+                self._append(Notice(f"Export failed: {e}"))
             return True
         if cmd == "model":
             parts = text.split()
@@ -244,6 +278,7 @@ class DSCApp(App):
         self.loop = AgentLoop(self.config, self.loop.registry, self.cwd, store.name)
         self.loop.meter = old_meter  # keep cost history
         self._titled = self.loop.title is not None
+        self._follow = True
         self.query_one("#log", VerticalScroll).remove_children()
         info = describe_session(store.path)
         self._append(Notice(f"Resumed '{info.title}' ({len(msgs)} messages) — history below:"))
@@ -291,21 +326,25 @@ class DSCApp(App):
             if self._reasoning is None:
                 self._reasoning = ReasoningBlock()
                 self._append(self._reasoning)
+                self._set_activity("thinking…")
             self._reasoning.append(self._reasoning_buf)
         elif ev.kind == "text":
             if self._live is None:
                 self._live = AssistantMessage("")
                 self._append(self._live)
+                self._set_activity("streaming…")
             # append_text returns True only when it actually repainted; tie
             # scroll to the same cadence so we don't reflow the log per token.
             if self._live.append_text(ev.text):
                 self._scroll()
         elif ev.kind == "tool_start":
             self._append(ToolLine(f"→ {ev.display}", running=True))
+            self._set_activity(f"→ {ev.display}")
         elif ev.kind == "tool_end":
             self._append(ToolLine(("✗ " if ev.is_error else "✓ ") + ev.display, error=ev.is_error))
             if ev.text:
-                self._append(ToolOutput(ev.text))
+                # Errors and short results auto-expand; long output stays folded.
+                self._append(ToolOutput(ev.text, error=ev.is_error))
             # Next assistant text starts a fresh message bubble.
             self._reset_live()
         elif ev.kind == "notice":
@@ -316,14 +355,58 @@ class DSCApp(App):
     def _reset_live(self) -> None:
         if self._live is not None:
             self._live.finalize()  # streaming plain text → full Markdown render
+            self._render_mermaid(self._live._text)
             self._scroll()
         self._live = None
         self._reasoning = None
         self._reasoning_buf = ""
 
+    def _render_mermaid(self, text: str) -> None:
+        """Append a MermaidBlock for each ```mermaid block in a finished reply.
+
+        Best-effort: if termaid isn't installed or a diagram fails to render,
+        the block is skipped and the original code stays in the message. Only
+        runs after the message is complete (no half-streamed diagrams).
+        """
+        from .mermaid import extract_mermaid_blocks, safe_render
+
+        for source in extract_mermaid_blocks(text):
+            diagram = safe_render(source)
+            if diagram is not None:
+                self._append(MermaidBlock(diagram, source))
+
     def _finish_turn(self) -> None:
         self._busy = False
+        self._clear_activity()
         self._refresh_status()
+
+    # -- busy / activity indicator -------------------------------------------
+
+    def _set_activity(self, text: str) -> None:
+        """Show what the agent is doing on the input box caption."""
+        try:
+            self.query_one(PromptInput).border_title = f"⏳ {text}"
+        except Exception:
+            pass  # UI teardown / not mounted — never break the turn
+
+    def _clear_activity(self) -> None:
+        """Restore the idle key-binding caption once the turn ends."""
+        try:
+            self.query_one(PromptInput).border_title = self._PROMPT_HINT
+        except Exception:
+            pass
+
+    # -- auto-scroll follow ---------------------------------------------------
+
+    def on_mouse_scroll_up(self, event) -> None:
+        # The user is reading back — stop yanking the view to the tail.
+        self._follow = False
+
+    def on_mouse_scroll_down(self, event) -> None:
+        # Re-enable follow once they roll back down to (near) the bottom.
+        log = self.query_one("#log", VerticalScroll)
+        if log.scroll_offset.y >= log.max_scroll_y - 1:
+            self._follow = True
 
     # -- helpers --------------------------------------------------------------
 
@@ -332,6 +415,8 @@ class DSCApp(App):
         self._scroll()
 
     def _scroll(self) -> None:
+        if not self._follow:
+            return
         self.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
     def _refresh_status(self) -> None:
