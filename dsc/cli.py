@@ -15,12 +15,130 @@ import argparse
 import os
 import sys
 
+# ── bundle bootstrap (only activates in Nuitka-compiled builds) ──────────
+# When running as a compiled exe, third-party packages live in a `packages/`
+# directory next to the exe.  If missing, we download them on first launch.
+
+try:
+    from ._build_config import BUNDLE_VERSION, BUNDLE_DOWNLOAD_BASE
+except ImportError:
+    BUNDLE_VERSION = None
+    BUNDLE_DOWNLOAD_BASE = None
+
+
+def _bundle_bootstrap() -> None:
+    """Ensure third-party ``packages/`` dir exists next to the compiled exe.
+
+    Only runs when ``sys.frozen`` is set (Nuitka / PyInstaller builds).
+    Downloads ``packages.zip`` from the release page and extracts it if
+    the directory is missing.
+    """
+    if not getattr(sys, "frozen", False):
+        return  # running from source — packages are installed by pip
+
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    packages_dir = os.path.join(exe_dir, "packages")
+
+    # Already set up?
+    if os.path.isdir(packages_dir) and any(
+        fname.endswith((".py", ".pyc", ".pyd"))
+        for fname in os.listdir(packages_dir)
+    ):
+        sys.path.insert(0, packages_dir)
+        return
+
+    if not BUNDLE_DOWNLOAD_BASE or not BUNDLE_VERSION:
+        print(
+            "error: this is a bundled exe but no download URL was configured.\n"
+            "       Please re-download from the official release page.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    import urllib.request
+    import zipfile
+
+    # Priority 1: env var override.
+    url = os.environ.get("DSC_PACKAGES_URL") or (
+        f"{BUNDLE_DOWNLOAD_BASE}/packages.zip" if BUNDLE_DOWNLOAD_BASE else None
+    )
+
+    # Priority 2: local packages.zip next to the exe.
+    local_zip = os.path.join(exe_dir, "packages.zip")
+
+    if url and not os.path.isfile(local_zip):
+        zip_path = os.path.join(exe_dir, "packages.zip.tmp")
+        print(f"\n📦  First launch — downloading dependencies ({BUNDLE_VERSION})…")
+        print(f"   {url}\n")
+        try:
+            urllib.request.urlretrieve(url, zip_path, _bundle_progress)
+            print()
+            _extract_zip(zip_path, packages_dir)
+        except Exception as exc:
+            print(f"\n   Download failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            if os.path.isfile(zip_path):
+                os.remove(zip_path)
+    elif os.path.isfile(local_zip):
+        print(f"\n📦  Extracting local packages.zip…")
+        _extract_zip(local_zip, packages_dir)
+    else:
+        print(
+            "error: dependencies not found. Place packages.zip next to dsc.exe\n"
+            "       or set DSC_PACKAGES_URL to a download link.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sys.path.insert(0, packages_dir)
+    print("   Done.\n")
+
+
+def _extract_zip(zip_path: str, target_dir: str) -> None:
+    import zipfile
+    import os
+    os.makedirs(target_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(target_dir)
+
+
+def _bundle_progress(block: int, block_size: int, total: int) -> None:
+    """Simple progress indicator for ``urlretrieve``."""
+    if total > 0 and block % 8 == 0:  # update ~every 64 KB
+        pct = min(block * block_size * 100 // total, 100)
+        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        print(f"\r   [{bar}] {pct}%", end="", file=sys.stderr)
+
+
+# ── main ─────────────────────────────────────────────────────────────────
+
 from .config import load_config
 from .session import SessionStore
 from .tools import build_registry
 
+# ── display helper ───────────────────────────────────────────────────────
+# On CJK Windows terminals circled digits (①②③) render at 1 cell wide.
+# When adjacent to 2-cell-wide Han characters they visually merge.  We add
+# a space after each circled digit purely for display.
+_CIRCLED = frozenset(chr(cp) for cp in range(0x2460, 0x2500)) | \
+           frozenset(chr(cp) for cp in range(0x2776, 0x2794))
+
+
+def _space_circled(text: str) -> str:
+    """Insert a space after each circled digit (display only)."""
+    if not text:
+        return text
+    parts = []
+    for ch in text:
+        parts.append(ch)
+        if ch in _CIRCLED:
+            parts.append(" ")
+    return "".join(parts)
+
 
 def main(argv: list[str] | None = None) -> int:
+    _bundle_bootstrap()
     parser = argparse.ArgumentParser(prog="dsc", description="DeepSeek Code — terminal coding agent.")
     parser.add_argument("-p", "--prompt", help="Run a single prompt headlessly and exit.")
     parser.add_argument("--plain", action="store_true", help="Plain REPL without the TUI.")
@@ -100,7 +218,7 @@ def _run_headless(config, registry, cwd: str, prompt: str, session_name: str | N
     loop = AgentLoop(config, registry, cwd, session_name)
     for ev in loop.send(prompt):
         if ev.kind == "text":
-            sys.stdout.write(ev.text)
+            sys.stdout.write(_space_circled(ev.text))
             sys.stdout.flush()
         elif ev.kind == "tool_end":
             marker = "✗" if ev.is_error else "✓"
@@ -142,9 +260,9 @@ def _run_plain(config, registry, cwd: str, session_name: str | None = None) -> i
 
 def _emit_plain(ev) -> None:
     if ev.kind == "reasoning":
-        sys.stdout.write(f"\x1b[2m{ev.text}\x1b[0m")
+        sys.stdout.write(f"\x1b[2m{_space_circled(ev.text)}\x1b[0m")
     elif ev.kind == "text":
-        sys.stdout.write(ev.text)
+        sys.stdout.write(_space_circled(ev.text))
     elif ev.kind == "tool_start":
         sys.stdout.write(f"\n\x1b[36m→ {ev.display}\x1b[0m\n")
     elif ev.kind == "tool_end":

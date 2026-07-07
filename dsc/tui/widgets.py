@@ -29,6 +29,25 @@ from textual.widgets import Collapsible, Static
 
 from .clipboard import copy_to_clipboard
 
+# ── display helper ───────────────────────────────────────────────────────
+# On CJK terminals circled digits (①②③) render at 1 cell wide.  When mixed
+# with 2-cell-wide Han characters they visually merge.  We add one space
+# after each circled digit for display; the copy button still copies raw text.
+_CIRCLED = frozenset(chr(cp) for cp in range(0x2460, 0x2500)) | \
+           frozenset(chr(cp) for cp in range(0x2776, 0x2794))
+
+
+def _display_text(raw: str) -> str:
+    """Insert a space after each circled digit for visual spacing."""
+    if not raw:
+        return raw
+    parts = []
+    for ch in raw:
+        parts.append(ch)
+        if ch in _CIRCLED:
+            parts.append(" ")
+    return "".join(parts)
+
 
 class CopyButton(Static):
     """A tiny clickable affordance; clicking copies its payload to the clipboard."""
@@ -119,7 +138,7 @@ class _InlineBlock(Horizontal):
 
 class UserMessage(_Block):
     def __init__(self, text: str):
-        self._body = Static(Text(f"› {text}", style="bold"))
+        self._body = Static(Text(f"› {_display_text(text)}", style="bold"))
         self._bar = _CopyBar(text)
         super().__init__(self._body, self._bar)
 
@@ -140,7 +159,7 @@ class ReasoningBlock(_Block):
         super().__init__(self._collapsible, self._bar)
 
     def append(self, reasoning: str) -> None:
-        self._body.update(Text(reasoning, style="dim italic"))
+        self._body.update(Text(_display_text(reasoning), style="dim italic"))
         self._bar.set_payload(reasoning)
 
 
@@ -160,7 +179,8 @@ class AssistantMessage(_Block):
         self._text = text
         self._dirty = False
         self._last_render = 0.0
-        self._body = Static(Markdown(text) if text else Text(""))
+        display = _display_text(text)
+        self._body = Static(Markdown(display) if display else Text(""))
         self._bar = _CopyBar(text)
         super().__init__(self._body, self._bar)
 
@@ -178,14 +198,15 @@ class AssistantMessage(_Block):
         if now - self._last_render >= self._STREAM_INTERVAL:
             self._last_render = now
             self._dirty = False
-            self._body.update(Text(self._text))  # plain text: cheap while streaming
+            self._body.update(Text(_display_text(self._text)))  # spaces for display
             return True
         return False
 
     def finalize(self) -> None:
         """Replace the streaming plain text with the full Markdown render."""
-        if self._text:
-            self._body.update(Markdown(self._text))
+        display = _display_text(self._text)
+        if display:
+            self._body.update(Markdown(display))
         self._dirty = False
         self._last_render = time.monotonic()
         self._bar.set_payload(self._text)
@@ -196,12 +217,12 @@ class ToolLine(_InlineBlock):
 
     def __init__(self, text: str, running: bool = False, error: bool = False):
         style = "red" if error else ("cyan" if running else "dim")
-        super().__init__(Static(Text(text, style=style)), text)
+        super().__init__(Static(Text(_display_text(text), style=style)), text)
 
 
 class Notice(_InlineBlock):
     def __init__(self, text: str):
-        super().__init__(Static(Text(f"• {text}", style="yellow")), text)
+        super().__init__(Static(Text(f"• {_display_text(text)}", style="yellow")), text)
 
 
 class ToolOutput(_Block):

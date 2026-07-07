@@ -37,6 +37,12 @@ class LoopEvent:
     is_error: bool = False
 
 
+# Archive heuristic: a turn shorter than this isn't worth a sub-agent call.
+# A task that produced a real artifact (file edit + tool result + summary)
+# is almost always > 800 chars; pure queries and quick clarifications are
+# usually < 500. This is a cheap pre-filter, not a semantic judgment.
+_ARCHIVE_MIN_CHARS = 800
+
 # Naming is done by a throwaway, isolated call — its messages never enter
 # self.ctx, so the main conversation's cached prefix stays untouched.
 _NAMING_SYSTEM = (
@@ -47,8 +53,13 @@ _NAMING_SYSTEM = (
 
 # Isolated sub-agent for task archiving.
 _ARCHIVE_SYSTEM = (
-    "You are archiving a completed coding task. Given the conversation below, "
-    "produce a JSON object with exactly these three fields:\n"
+    "You decide whether a completed turn should be archived and, if so, "
+    "produce its metadata. Given the conversation below, output a JSON object "
+    "with exactly these four fields:\n"
+    '- "archive": boolean. true ONLY if this turn produced a lasting artifact '
+    "(a modified/created file, a meaningful command run, a concrete problem "
+    "resolved). Return false for pure queries, chit-chat, clarifications, or "
+    "trivial exchanges even if a tool was called.\n"
     '- "summary": one-line summary (max 80 chars)\n'
     '- "keywords": comma-separated search terms (max 10, include filenames, '
     "symbols, tech terms)\n"
@@ -218,15 +229,20 @@ class AgentLoop:
         return None
 
     def _maybe_archive_turn(self, assistant_text: str) -> None:
-        """Soft-hint: if the turn looks complete, archive it in the background.
+        """Archive this turn if it represents a completed task.
 
-        This is a hint, not a hard rule — missing a boundary just means the
-        messages stay verbose until the next compaction pass.
+        Three gates, cheapest first:
+          1. Structural: did the turn invoke any tools? Pure Q&A has no
+             ``role=="tool"`` messages → skip (no sub-agent call).
+          2. Length: a turn shorter than ``_ARCHIVE_MIN_CHARS`` isn't worth
+             archiving → skip.
+          3. Semantic: the archive sub-agent decides whether the turn produced
+             a lasting artifact and returns ``should_archive`` accordingly.
+
+        Missing a boundary just means the messages stay verbose until the next
+        compaction pass — this is best-effort and never breaks the session.
         """
         if not assistant_text:
-            return
-        # Simple heuristic: completion language in the assistant's reply.
-        if not self._has_completion_signal(assistant_text):
             return
 
         # Collect messages for this turn (user → assistant(s) → tools).
@@ -238,6 +254,18 @@ class AgentLoop:
         if len(turn_msgs) < 2:  # need at least user + assistant
             return
 
+        # Gate 1: structural — only archive turns that invoked tools. A pure
+        # conversational exchange (clarification, Q&A) carries no artifact worth
+        # archiving and should stay in the live context. This check is free.
+        if not any(m.get("role") == "tool" for m in turn_msgs):
+            return
+
+        # Gate 2: length — very short turns, even with a tool call, rarely
+        # produce enough substance to justify the sub-agent cost.
+        if sum(len(m.get("content") or "") for m in turn_msgs) < _ARCHIVE_MIN_CHARS:
+            return
+
+        # Gate 3: semantic — let the sub-agent decide.
         try:
             result = self._archive_task(turn_msgs)
         except Exception:
@@ -247,7 +275,10 @@ class AgentLoop:
         if result is None:
             return
 
-        summary, keywords, in_context = result
+        should_archive, summary, keywords, in_context = result
+        if not should_archive:
+            log("archive: sub-agent vetoed (no lasting artifact)")
+            return
 
         # Write to disk.
         aid = self._archive_next_id
@@ -273,21 +304,13 @@ class AgentLoop:
 
         log(f"archive: task #{aid} — {summary}")
 
-    @staticmethod
-    def _has_completion_signal(text: str) -> bool:
-        """Cheap heuristic: does the assistant text signal task completion?"""
-        signals = [
-            "done", "fixed", "finished", "completed", "added", "created",
-            "implemented", "resolved", "closed", "ready", "搞定", "完成",
-            "已添加", "已修复", "验证通过",
-        ]
-        lower = text.lower()
-        return any(s in lower for s in signals)
-
-    def _archive_task(self, messages: list[dict]) -> tuple[str, str, str] | None:
+    def _archive_task(self, messages: list[dict]) -> tuple[bool, str, str, str] | None:
         """Isolated sub-agent that generates archive metadata for a completed task.
 
-        Returns ``(summary, keywords, in_context_summary)`` or ``None`` on failure.
+        Returns ``(should_archive, summary, keywords, in_context_summary)`` or
+        ``None`` on failure. ``should_archive`` defaults to ``True`` when the
+        model omits the field, since callers already pre-filter to high-probability
+        candidates (tool-bearing turns of meaningful length).
         """
         transcript = _flatten(messages)
         req = [
@@ -313,6 +336,7 @@ class AgentLoop:
             except json.JSONDecodeError:
                 return None
         return (
+            bool(data.get("archive", True)),
             data.get("summary", ""),
             data.get("keywords", ""),
             data.get("in_context_summary", ""),

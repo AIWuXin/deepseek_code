@@ -8,16 +8,23 @@ Textual's diff renderer repaint only what changed.
 
 from __future__ import annotations
 
+import os
+
+from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.widgets import Footer, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
+from textual.widgets import DirectoryTree, Footer, Rule, Static
 
 from ..agent.loop import AgentLoop, _preview
 from ..session import SessionStore, describe_session
+from . import gitstatus
 from .commands import CommandScreen
 from .prompt import PromptInput
 from .session_picker import SessionPickerScreen
+from .tree_menu import PreviewScreen
 from .widgets import (
     AssistantMessage,
     MermaidBlock,
@@ -44,6 +51,170 @@ class StatusBar(Static):
         )
 
 
+# git status bucket → (marker char, colour). Marker rides in the label's left
+# gutter so status reads at a glance even in a narrow sidebar.
+_GIT_STYLE = {
+    gitstatus.MODIFIED: ("M", "yellow"),
+    gitstatus.ADDED: ("A", "green"),
+    gitstatus.UNTRACKED: ("?", "green"),
+    gitstatus.DELETED: ("D", "red"),
+    gitstatus.RENAMED: ("R", "cyan"),
+}
+
+
+class ProjectTree(DirectoryTree):
+    """Directory tree for the workspace, filtered and status-aware.
+
+    Beyond hiding VCS/build/cache clutter, each label is painted from two
+    overlays the app keeps current:
+
+      * ``edited_paths`` — files the agent wrote/edited this session get a ``●``
+        accent marker so you see what the turn touched.
+      * ``git_status``  — {abs-path: bucket} colours new/modified/deleted files.
+
+    The agent-edited marker takes precedence over git colour (it's the more
+    immediately relevant signal while you work).
+    """
+
+    _HIDE = {
+        ".git", ".hg", ".svn", ".venv", "venv", "__pycache__",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea", ".vscode",
+        "node_modules", ".DS_Store", "dist", "build", ".egg-info",
+    }
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Both keyed by absolute, normalised path string.
+        self.edited_paths: set[str] = set()
+        self.git_status: dict[str, str] = {}
+
+    def filter_paths(self, paths):
+        return [
+            p for p in paths
+            if p.name not in self._HIDE and not p.name.endswith(".egg-info")
+        ]
+
+    def set_git_status(self, mapping: dict[str, str]) -> None:
+        self.git_status = mapping
+        self._repaint_labels()
+
+    def mark_edited(self, abs_path: str) -> None:
+        self.edited_paths.add(os.path.normcase(os.path.abspath(abs_path)))
+        self._repaint_labels()
+
+    def _repaint_labels(self) -> None:
+        # Force every visible label through render_label again. refresh() alone
+        # doesn't re-run label rendering; invalidating the line cache does.
+        try:
+            self._invalidate()
+        except Exception:
+            self.refresh()
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = getattr(node, "data", None)
+        path = getattr(data, "path", None)
+        if path is None:
+            return label
+        key = os.path.normcase(os.path.abspath(str(path)))
+        # Agent-edited marker wins over git colour.
+        if key in self.edited_paths:
+            return Text.assemble(("● ", "bold magenta"), label)
+        bucket = self.git_status.get(key)
+        if bucket:
+            marker, colour = _GIT_STYLE.get(bucket, ("", ""))
+            if marker:
+                out = Text.assemble((f"{marker} ", colour), label)
+                out.stylize(colour)
+                return out
+        return label
+
+
+class FileToolbar(Horizontal):
+    """Two clickable actions for the tree's selected file, docked at the sidebar
+    foot.
+
+    Left-click only (right-click is intercepted by terminals like Windows
+    Terminal, so it never reaches the app). Each item is a small clickable
+    ``Static`` — the same lightweight affordance the conversation's CopyButton
+    uses — posting a message the app dispatches. Kept to two: dropping the path
+    into the prompt (compose your own request) and a no-cost read-only preview.
+
+    Styled as a card that matches the prompt box and preview modal: a rounded
+    accent border, a panel background, and a ``border_title``. It costs two
+    extra rows (height 3 vs the old 1) but reads as a deliberate panel rather
+    than floating text — consistent with the rest of the sidebar-less UI.
+    """
+
+    DEFAULT_CSS = """
+    FileToolbar {
+        dock: bottom;
+        height: 3;
+        width: 100%;
+        /* Rounded accent card, but matching the tree's $surface background (not
+           $panel) — a $panel bar reads as another prompt/dialog box, which is
+           exactly the confusion we're avoiding. It should feel like part of the
+           sidebar, not a floating input. */
+        border: round $accent;
+        background: $surface;
+        /* No top margin: the divider Rule already separates it from the tree,
+           so the card sits flush beneath the seam. */
+        margin: 0;
+        padding: 0 1;
+        align-horizontal: center;
+        align-vertical: middle;
+    }
+    /* Each action takes an equal half of the bar so both buttons — and thus
+       both hover highlights — are exactly the same size regardless of label
+       length. Text is centred within its half. */
+    FileToolbar .act {
+        width: 1fr;
+        height: 1;
+        content-align: center middle;
+        text-align: center;
+        color: $accent;
+        text-style: bold;
+    }
+    FileToolbar .act:hover {
+        color: $text;
+        background: $accent;
+    }
+    /* A thin separator between the two halves. */
+    FileToolbar .sep {
+        width: 1;
+        height: 1;
+        color: $text-muted;
+    }
+    """
+
+    # (action-id, label). Two actions, each filling half the bar. Symbols are
+    # monochrome line glyphs (no colour emoji) to match the ＋ / ⧉ house style.
+    _ACTIONS = [
+        ("insert", "＋ 插入对话"),
+        ("preview", "☰ 预览"),
+    ]
+
+    class Action(Message):
+        def __init__(self, action: str) -> None:
+            self.action = action
+            super().__init__()
+
+    def compose(self) -> ComposeResult:
+        for i, (action_id, label) in enumerate(self._ACTIONS):
+            if i > 0:
+                yield Static("│", classes="sep")
+            item = Static(label, classes="act")
+            item._action_id = action_id  # read back on click
+            yield item
+
+    def on_click(self, event: events.Click) -> None:
+        widget = event.widget
+        action_id = getattr(widget, "_action_id", None)
+        if action_id:
+            event.stop()
+            self.post_message(self.Action(action_id))
+
+
 class DSCApp(App):
     # rose-pine-moon is a built-in Textual theme; noticeably nicer than default.
     THEME = "rose-pine-moon"
@@ -51,12 +222,51 @@ class DSCApp(App):
     CSS = """
     Screen { layout: vertical; }
     StatusBar { dock: top; height: 1; background: $panel; color: $text; padding: 0 1; }
+    /* The conversation log and the project sidebar share a horizontal row that
+       fills the space between the status bar and the docked prompt. */
+    #body { height: 1fr; }
     #log {
-        height: 1fr;
+        width: 1fr;
+        height: 100%;
         padding: 0 1;
         /* Reserve a column for the scrollbar so it never overlaps text on the
            right edge (the cause of the truncated-looking wrap). */
         scrollbar-gutter: stable;
+    }
+    /* The sidebar is a vertical stack: the scrolling tree fills the space, the
+       action toolbar docks at its bottom. */
+    #sidebar {
+        width: 34;
+        height: 100%;
+        border-left: solid $accent;
+        background: $panel;
+    }
+    /* Toggled off by ctrl+b: collapse away and drop the border. */
+    #sidebar.hidden { display: none; }
+    #tree {
+        width: 100%;
+        height: 1fr;
+        padding: 0 1;
+    }
+    /* Divider between the file list and the action bar. A default Rule reserves
+       three rows for margins; collapse it to a single tinted line so it reads
+       as a seam, not a gap. */
+    .sidebar-rule {
+        height: 1;
+        margin: 0;
+        color: $accent 40%;
+        background: $surface;
+    }
+    /* The tree never holds focus (the prompt does), so Textual would dim the
+       selected row to near-invisible. Force a clear accent highlight on the
+       cursor row so "which file is selected" is always obvious. */
+    #tree > .tree--cursor {
+        background: $accent 40%;
+        color: $text;
+        text-style: bold;
+    }
+    #tree > .tree--highlight-line {
+        background: $accent 20%;
     }
     /* Cap content width so long lines wrap in a readable column instead of
        running into the right border. */
@@ -86,14 +296,14 @@ class DSCApp(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("escape", "interrupt", "Interrupt"),
         Binding("f1", "show_commands", "Commands", priority=True),
-        Binding("ctrl+p", "show_commands", "Commands", priority=True),
+        Binding("ctrl+b", "toggle_sidebar", "Files", priority=True),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
     # Idle prompt caption; also restored after each turn (see _clear_activity).
-    _PROMPT_HINT = "Enter send · Shift+Enter newline · F1 commands · Esc interrupt · Ctrl+C quit"
+    _PROMPT_HINT = "Enter send · Ctrl+Enter newline · F1 commands · Ctrl+Q quit"
 
     def __init__(self, config, registry, cwd: str, session_name: str | None = None):
         super().__init__()
@@ -111,10 +321,26 @@ class DSCApp(App):
         # Auto-scroll follows the tail until the user scrolls up; it resumes when
         # they scroll back to the bottom or send a new message.
         self._follow = True
+        # Absolute path of the file currently selected in the tree; the sidebar
+        # toolbar acts on it. None until the user clicks a file.
+        self._selected_file: str | None = None
 
     def compose(self) -> ComposeResult:
         yield StatusBar()
-        yield VerticalScroll(id="log")
+        with Horizontal(id="body"):
+            yield VerticalScroll(id="log")
+            with Vertical(id="sidebar") as sidebar:
+                sidebar.border_title = "Project"
+                tree = ProjectTree(self.cwd, id="tree")
+                # The tree must never steal focus from the prompt on tab; the
+                # user drives it with the mouse.
+                tree.can_focus = False
+                yield tree
+                # A thin divider sets the action bar apart from the file list.
+                yield Rule(line_style="heavy", classes="sidebar-rule")
+                toolbar = FileToolbar()
+                toolbar.border_title = "选中文件"
+                yield toolbar
         prompt = PromptInput()
         prompt.border_title = self._PROMPT_HINT
         yield prompt
@@ -128,6 +354,7 @@ class DSCApp(App):
         else:
             self._welcome()
         self._refresh_status()
+        self._refresh_git_status()
         self.query_one(PromptInput).focus()
 
     def _welcome(self) -> None:
@@ -135,6 +362,7 @@ class DSCApp(App):
         self._append(Notice(
             f"DeepSeek Code · {self.loop.config.model}\n"
             "  Enter 发送 · Shift+Enter 换行 · F1 命令 · Esc 中断\n"
+            "  Ctrl+B 切换目录树 · 点文件选中 · 底部按钮 插入对话 / 预览\n"
             "  /help 查看全部命令 · /export 导出对话"
         ))
 
@@ -241,7 +469,7 @@ class DSCApp(App):
     # -- command menu & session picker ---------------------------------------
 
     def action_show_commands(self) -> None:
-        """Open the command palette (bound to F1 / Ctrl+P / click in Footer)."""
+        """Open the command palette (bound to F1 / click in Footer)."""
         self.push_screen(CommandScreen(), self._on_command_selected)
 
     def _on_command_selected(self, cmd: str | None) -> None:
@@ -345,6 +573,9 @@ class DSCApp(App):
             if ev.text:
                 # Errors and short results auto-expand; long output stays folded.
                 self._append(ToolOutput(ev.text, error=ev.is_error))
+            # Mark files the agent just wrote/edited so they stand out in the tree.
+            if not ev.is_error:
+                self._note_edited_file(ev.display)
             # Next assistant text starts a fresh message bubble.
             self._reset_live()
         elif ev.kind == "notice":
@@ -379,6 +610,8 @@ class DSCApp(App):
         self._busy = False
         self._clear_activity()
         self._refresh_status()
+        # A turn may have created/modified files; re-read git so colours match.
+        self._refresh_git_status()
 
     # -- busy / activity indicator -------------------------------------------
 
@@ -429,6 +662,89 @@ class DSCApp(App):
             m.usd,
             title=self.loop.title,
         )
+
+    def action_toggle_sidebar(self) -> None:
+        """Show/hide the project tree (ctrl+b). Keeps focus on the prompt."""
+        self.query_one("#sidebar").toggle_class("hidden")
+
+    def on_directory_tree_file_selected(
+        self, event: DirectoryTree.FileSelected
+    ) -> None:
+        """Left-clicking a file only *selects* it (the toolbar's target).
+
+        Deliberately does nothing else: selecting a file to preview shouldn't
+        shove its path into the prompt. Use the "＋ 插入对话" button when you
+        actually want the path in your message.
+        """
+        self._selected_file = str(event.path)
+
+    def _rel(self, path: str) -> str:
+        try:
+            return os.path.relpath(path, self.cwd)
+        except ValueError:
+            return path  # different drive on Windows → keep absolute
+
+    # -- sidebar toolbar ------------------------------------------------------
+
+    def on_file_toolbar_action(self, event: "FileToolbar.Action") -> None:
+        """Dispatch a sidebar action button against the selected file."""
+        path = self._selected_file
+        if not path:
+            self._append(Notice("先在目录树点选一个文件，再点下面的按钮。"))
+            return
+        rel = self._rel(path)
+        if event.action == "preview":
+            self.push_screen(PreviewScreen(path, rel))
+        elif event.action == "insert":
+            prompt = self.query_one(PromptInput)
+            # Trailing space so consecutive inserts don't glue paths together.
+            prompt.insert(rel + " ")
+            prompt.focus()
+
+    # -- git status / edited markers ------------------------------------------
+
+    def _refresh_git_status(self) -> None:
+        """Recolour the tree from `git status` (absolute-path keyed)."""
+        try:
+            tree = self.query_one("#tree", ProjectTree)
+        except Exception:
+            return
+        status = gitstatus.git_status(self.cwd)
+        root = gitstatus.git_root(self.cwd)
+        if root is None:
+            tree.set_git_status({})
+            return
+        # git paths are repo-relative; the tree keys on absolute normalised paths.
+        mapping = {
+            os.path.normcase(os.path.abspath(str(root / rel))): bucket
+            for rel, bucket in status.items()
+        }
+        tree.set_git_status(mapping)
+
+    def _note_edited_file(self, display: str) -> None:
+        """Extract a write/edit target from a tool_end display and mark it.
+
+        Displays look like "write path/to/x.py (12 lines)" or
+        "edit path/to/x.py (-1/+3)". We take the second whitespace token as the
+        path and reload the tree so freshly-created files appear.
+        """
+        parts = display.split()
+        if len(parts) < 2 or parts[0] not in ("write", "edit"):
+            return
+        rel = parts[1]
+        abs_path = os.path.abspath(os.path.join(self.cwd, rel))
+        try:
+            tree = self.query_one("#tree", ProjectTree)
+        except Exception:
+            return
+        is_new = parts[0] == "write" and abs_path not in tree.edited_paths
+        tree.mark_edited(abs_path)
+        if is_new:
+            # A newly created file won't be in the tree yet — reload structure.
+            try:
+                tree.reload()
+            except Exception:
+                pass
 
     def action_interrupt(self) -> None:
         # Cooperative: cancel the worker; the loop checks between iterations.
