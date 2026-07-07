@@ -265,44 +265,51 @@ class AgentLoop:
         if sum(len(m.get("content") or "") for m in turn_msgs) < _ARCHIVE_MIN_CHARS:
             return
 
-        # Gate 3: semantic — let the sub-agent decide.
+        # Gate 3 + write + mark: shared with the cleanup-driven archiver.
+        start = self.ctx.find_clean_task_boundary(self.ctx.messages, start_idx)
+        end = len(self.ctx.messages)
+        self._archive_range(start, end)
+
+    def _archive_range(self, start: int, end: int) -> bool:
+        """Archive the message range ``[start, end)`` if the sub-agent approves.
+
+        Runs the semantic gate (``_archive_task``), writes the block to disk, and
+        marks the range so later compression can fold it into a summary. Returns
+        ``True`` when a block was written. Best-effort: any failure logs and
+        returns ``False`` without disturbing the session. ``start`` must land on
+        a ``user`` boundary; callers align it (``find_clean_task_boundary`` /
+        ``next_unarchived_old_turn``).
+        """
+        msgs = self.ctx.messages
+        if not (0 <= start < end <= len(msgs)) or msgs[start].get("role") != "user":
+            return False
+        turn_msgs = list(msgs[start:end])
+
         try:
             result = self._archive_task(turn_msgs)
         except Exception:
             log("archive_task: sub-agent call failed (non-fatal)")
-            return  # best-effort; never break the session
-
+            return False  # best-effort; never break the session
         if result is None:
-            return
+            return False
 
         should_archive, summary, keywords, in_context = result
         if not should_archive:
             log("archive: sub-agent vetoed (no lasting artifact)")
-            return
+            return False
 
-        # Write to disk.
         aid = self._archive_next_id
         self._archive_next_id += 1
-        block = ArchiveBlock(
+        self._store.archive_block(ArchiveBlock(
             id=aid,
             summary=summary,
             keywords=keywords,
             in_context_summary=in_context,
             messages=turn_msgs,
-        )
-        self._store.archive_block(block)
-
-        # Mark messages in context as archived.  Ensure we start at a clean
-        # user boundary so later compression won't cut a tool chain in half.
-        start = self.ctx.find_clean_task_boundary(self.ctx.messages, start_idx)
-        end = len(self.ctx.messages)
-        # Only mark when ``start`` truly lands on a user turn boundary; a stale
-        # index could otherwise sweep the previous turn into this archive id and
-        # corrupt the range for later compression (J1/J2).
-        if 0 <= start < end and self.ctx.messages[start].get("role") == "user":
-            self.ctx.mark_archived(start, end, aid)
-
+        ))
+        self.ctx.mark_archived(start, end, aid)
         log(f"archive: task #{aid} — {summary}")
+        return True
 
     def _archive_task(self, messages: list[dict]) -> tuple[bool, str, str, str] | None:
         """Isolated sub-agent that generates archive metadata for a completed task.
@@ -444,10 +451,23 @@ class AgentLoop:
                 "notice",
                 text=f"Cleaned {total_deleted} messages ({saved} tokens saved).",
             )
+        # Step 3: if still over budget, archive old un-archived tool-bearing
+        # turns that cleanup could only skip (no disk backup to fall back on),
+        # then compress them. This closes the loop cleanup left open — otherwise
+        # those turns sit in context until full compaction wipes everything.
+        archived_new = 0
+        if now > self.ctx.high_water:
+            archived_new = yield from self._archive_stale_turns()
+            if archived_new:
+                extra = self.ctx.compress_archived_ranges()
+                if extra:
+                    yield LoopEvent("notice", text=f"Archived + compressed {archived_new} stale task(s).")
+                now = self.ctx.estimated_tokens()
+
         # Sync store whenever the in-context history changed — including when
         # only compression fired (n>0) but nothing was deleted. Otherwise resume
         # reloads the old, uncompressed messages and silently loses the work (J3).
-        if n or total_deleted:
+        if n or total_deleted or archived_new:
             self._store.replace(self.ctx.messages)
 
         if now > self.ctx.high_water:
@@ -456,6 +476,29 @@ class AgentLoop:
             # low-water target.
             yield LoopEvent("notice", text="V2 cleaning insufficient — falling back to compaction.")
             yield from self._reclaim_old()
+
+    def _archive_stale_turns(self, max_turns: int = 4) -> Iterator[LoopEvent]:
+        """Archive up to ``max_turns`` old un-archived tool-bearing turns.
+
+        Yields nothing to the UI itself (caller summarizes); ``return``s the
+        count archived so the caller can compress and report. Bounded so one
+        reclamation pass can't fire a dozen sub-agent calls.
+        """
+        archived = 0
+        for _ in range(max_turns):
+            rng = self.ctx.next_unarchived_old_turn()
+            if rng is None:
+                break
+            start, end = rng
+            if self._archive_range(start, end):
+                archived += 1
+            else:
+                # Sub-agent vetoed or failed; stop to avoid re-scanning the same
+                # un-archivable turn forever (mark_archived didn't fire, so
+                # next_unarchived_old_turn would return it again).
+                break
+        return archived
+        yield  # make this a generator (never reached)
 
     def _reclaim_old(self) -> Iterator[LoopEvent]:
         """Original compaction: summarize early history (old behaviour)."""

@@ -367,6 +367,53 @@ class ContextManager:
             self._tokens_dirty = True
         return deleted_bu, deleted_ra, archived_new
 
+    def next_unarchived_old_turn(self) -> tuple[int, int] | None:
+        """Find the oldest un-archived complete turn in the reclaimable region.
+
+        ``cleanup_tail`` can delete messages already backed by an archive, but it
+        can only *skip* old originals that were never archived (case 3) — there's
+        nothing on disk to fall back to, so deleting them would lose data. This
+        method hands the loop such a turn as a clean ``[start, end)`` range so it
+        can archive it (via the sub-agent) and then reclaim it on the next pass.
+
+        Returns the first ``user``-bounded turn that:
+          * lies entirely before the protected tail (same boundary cleanup uses),
+          * carries no archive id on any of its messages,
+          * and actually contains a tool message (worth archiving; pure Q&A is
+            left in context, matching ``_maybe_archive_turn``'s gate 1).
+
+        Returns ``None`` when there's no such turn.
+        """
+        n = len(self._messages)
+        if n < 2:
+            return None
+        # Same protected-tail computation as cleanup_tail.
+        soft = self.find_clean_task_boundary(self._messages, max(0, n - 8))
+        keep_tail = soft if soft > 0 else self.find_clean_task_boundary(
+            self._messages, n - 1
+        )
+        if keep_tail <= 0:
+            return None
+
+        i = 0
+        while i < keep_tail:
+            if self._messages[i].get("role") != "user" or self._archive_id[i] is not None:
+                i += 1
+                continue
+            # Start of a candidate turn at a user boundary. Extend to the next
+            # user boundary (or the protected-tail edge, whichever comes first).
+            end = self._next_turn_boundary(self._messages, i + 1)
+            end = min(end, keep_tail)
+            block = self._messages[i:end]
+            # Only offer turns that are fully un-archived and tool-bearing.
+            if (
+                all(a is None for a in self._archive_id[i:end])
+                and any(m.get("role") == "tool" for m in block)
+            ):
+                return (i, end)
+            i = end
+        return None
+
     # -- Phase 3 helpers -------------------------------------------------------
 
     def populate_archives(self, archive_dir_path: str) -> None:

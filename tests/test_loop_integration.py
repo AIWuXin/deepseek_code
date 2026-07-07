@@ -127,6 +127,68 @@ def test_tool_handler_crash_never_dangles(tmp_path, monkeypatch):
     assert loop.client.calls == 2                  # loop continued past the crash
 
 
+def test_archive_stale_turns_closes_cleanup_gap(tmp_path, monkeypatch):
+    """cleanup can only skip un-archived old turns; the loop must archive them.
+
+    Builds an old, un-archived, tool-bearing turn, then drives the archiver and
+    asserts it wrote a block and marked the range — the gap that used to leave
+    ``archived_new`` permanently 0.
+    """
+    import dsc.session.store as store_mod
+    monkeypatch.setattr(store_mod, "SESSIONS_DIR", tmp_path / "sessions")
+
+    loop = AgentLoop(Config(api_key="x"), build_registry(str(tmp_path)), str(tmp_path))
+
+    # Sub-agent approves and returns metadata (no network).
+    monkeypatch.setattr(
+        loop, "_archive_task",
+        lambda msgs: (True, "did the thing", "foo,bar", "recap of the thing"),
+    )
+
+    # One old tool-bearing turn, then padding to push it out of the tail.
+    start = len(loop.ctx.messages)
+    loop.ctx.add_user("refactor the parser")
+    loop.ctx.add_assistant("", [{"id": "t1", "type": "function",
+                                 "function": {"name": "bash", "arguments": "{}"}}])
+    loop.ctx.add_tool_result("t1", "changed parser.py")
+    for i in range(10):
+        loop.ctx.add_user(f"later message {i}")
+
+    n = list(loop._archive_stale_turns())  # drain the generator
+    # It archived exactly one block...
+    blocks = loop._store.list_blocks()
+    assert len(blocks) == 1 and blocks[0]["summary"] == "did the thing"
+    # ...and marked that range so compression can fold it.
+    assert any(a is not None for a in loop.ctx._archive_id[start:start + 3])
+
+
+def test_archive_stale_turns_stops_on_veto(tmp_path, monkeypatch):
+    """A vetoed turn must stop the loop, not spin on the same un-archivable turn."""
+    import dsc.session.store as store_mod
+    monkeypatch.setattr(store_mod, "SESSIONS_DIR", tmp_path / "sessions")
+
+    loop = AgentLoop(Config(api_key="x"), build_registry(str(tmp_path)), str(tmp_path))
+    calls = {"n": 0}
+
+    def veto(msgs):
+        calls["n"] += 1
+        return (False, "", "", "")  # sub-agent says: not worth archiving
+
+    monkeypatch.setattr(loop, "_archive_task", veto)
+
+    loop.ctx.add_user("some task")
+    loop.ctx.add_assistant("", [{"id": "t", "type": "function",
+                                 "function": {"name": "bash", "arguments": "{}"}}])
+    loop.ctx.add_tool_result("t", "output")
+    for i in range(10):
+        loop.ctx.add_user(f"pad {i}")
+
+    list(loop._archive_stale_turns())
+    # Vetoed once, then bailed — did not re-scan the same turn forever.
+    assert calls["n"] == 1
+    assert loop._store.list_blocks() == []
+
+
 def test_prefix_stability(tmp_path):
     """System message stays byte-identical; history only grows at the tail."""
     cfg = Config(api_key="x")

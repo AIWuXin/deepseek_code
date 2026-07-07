@@ -470,6 +470,61 @@ def test_cleanup_tail_short_history_still_cleans_archived():
     ]
 
 
+def _tool_turn(m, user, aid=None):
+    """Append a user→assistant(tool_call)→tool turn; optionally mark archived."""
+    start = len(m.messages)
+    m.add_user(user)
+    m.add_assistant("", [{"id": "x", "type": "function",
+                          "function": {"name": "bash", "arguments": "{}"}}])
+    m.add_tool_result("x", "some output")
+    if aid is not None:
+        m.mark_archived(start, len(m.messages), aid)
+    return start
+
+
+def test_next_unarchived_old_turn_finds_toolbearing_turn():
+    m = _mgr()
+    _tool_turn(m, "old task that touched files")   # 0..3, un-archived
+    # Pad the tail so the old turn is well before the protected region.
+    for i in range(10):
+        m.add_user(f"pad{i}")
+    rng = m.next_unarchived_old_turn()
+    assert rng is not None
+    start, end = rng
+    assert start == 0
+    # Range is a complete turn (user + assistant + tool).
+    block = m.messages[start:end]
+    assert block[0]["role"] == "user"
+    assert any(x["role"] == "tool" for x in block)
+
+
+def test_next_unarchived_old_turn_skips_already_archived():
+    m = _mgr()
+    _tool_turn(m, "archived task", aid=5)          # already archived
+    for i in range(10):
+        m.add_user(f"pad{i}")
+    # The only old tool-bearing turn is archived → nothing to offer.
+    assert m.next_unarchived_old_turn() is None
+
+
+def test_next_unarchived_old_turn_skips_pure_qa():
+    m = _mgr()
+    # Old turn with NO tool message → not worth archiving, must be skipped.
+    m.add_user("what is this?")
+    m.add_assistant("an explanation")
+    for i in range(10):
+        m.add_user(f"pad{i}")
+    assert m.next_unarchived_old_turn() is None
+
+
+def test_next_unarchived_old_turn_protects_tail():
+    m = _mgr()
+    # A single recent tool-bearing turn, nothing before it → inside the
+    # protected tail, so it must not be offered for archiving.
+    _tool_turn(m, "recent task")
+    assert m.next_unarchived_old_turn() is None
+
+
 def test_cleanup_tail_deletes_backed_up_and_read_archive():
     m = _mgr(limit=1_000_000)
     m.add_user("archived task")
