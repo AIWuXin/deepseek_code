@@ -265,14 +265,44 @@ def test_restore_resets_archive_state():
     assert len(m._archives) == 0
 
 
-def test_completion_signal_detection():
-    from dsc.agent.loop import AgentLoop
+def test_archive_gating_structural_and_length(tmp_path, monkeypatch):
+    """Archiving is gated cheaply before any sub-agent call:
 
-    assert AgentLoop._has_completion_signal("Done — fixed the bug")
-    assert AgentLoop._has_completion_signal("搞定了，已添加 web_fetch 工具")
-    assert AgentLoop._has_completion_signal("All tests pass, issue resolved")
-    assert not AgentLoop._has_completion_signal("Let me investigate further")
-    assert not AgentLoop._has_completion_signal("")
+      1. structural — a turn with no tool messages is never archived;
+      2. length     — a tool-bearing turn under _ARCHIVE_MIN_CHARS is skipped.
+
+    Both gates must short-circuit *without* invoking the archive sub-agent
+    (which would cost a network call). We assert that by making _archive_task
+    blow up if it's ever reached.
+    """
+    import dsc.session.store as store_mod
+    from dsc.agent.loop import AgentLoop, _ARCHIVE_MIN_CHARS
+    from dsc.config import Config
+    from dsc.tools import build_registry
+
+    monkeypatch.setattr(store_mod, "SESSIONS_DIR", tmp_path / "sessions")
+    loop = AgentLoop(Config(api_key="x"), build_registry(str(tmp_path)), str(tmp_path))
+
+    def _boom(_msgs):
+        raise AssertionError("sub-agent must not be called when a gate rejects")
+
+    monkeypatch.setattr(loop, "_archive_task", _boom)
+
+    # Gate 1: pure Q&A (no tool message) → skipped, no sub-agent.
+    loop._turn_start_idx = len(loop.ctx.messages)
+    loop.ctx.add_user("what does this do?")
+    loop.ctx.add_assistant("It parses the config." * 50)  # long, but no tool msg
+    loop._maybe_archive_turn("It parses the config.")  # must not raise
+
+    # Gate 2: has a tool msg but the whole turn is tiny → skipped.
+    loop._turn_start_idx = len(loop.ctx.messages)
+    loop.ctx.add_user("ls")
+    loop.ctx.add_assistant("", [{"id": "t", "type": "function",
+                                 "function": {"name": "bash", "arguments": "{}"}}])
+    loop.ctx.add_tool_result("t", "a.py")  # tiny → under the min
+    assert sum(len(m.get("content") or "")
+               for m in loop.ctx.messages[loop._turn_start_idx:]) < _ARCHIVE_MIN_CHARS
+    loop._maybe_archive_turn("done")  # must not raise
 
 
 def test_compress_read_archive_small_content_noop():
